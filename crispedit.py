@@ -7,7 +7,6 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from tools import *
 from utils import chunks, save_model_and_tokenizer
 
-from easyeditor.mymodels.hparams import CrispLoRAHyperParams
 from easyeditor.models.crispedit.CrispEdit_hparams import CrispEditHyperParams
 from easyeditor.models.crispedit.utils import (
     cache_weights_to_cpu, 
@@ -22,9 +21,14 @@ from easyeditor.models.crispedit.utils import (
     wrap_model_with_lora_and_return_opt,
 )
 
-from easyeditor.mymodels.scheme_a_projected_lora import (
+from easyeditor.mymodels import (
+    CrispLoRAHyperParams,
     wrap_model_and_build_projected_optimizer,
+    build_lora_projection_cache,
+    attach_curvature_lora_variant,
+    set_curvature_bases,
 )
+from peft import LoraConfig, get_peft_model, TaskType
 
 
 def execute_ft(
@@ -362,24 +366,14 @@ def inspect_model_structure(model):
     print("=" * 100)
 
 
-def execute_ft_mylora(
+def execute_ft_grad_lora(
     model: AutoModelForCausalLM,
     tok: AutoTokenizer,
     requests: List[Dict],
     hparams: CrispLoRAHyperParams,
     **kwargs: Any,
 ) -> AutoModelForCausalLM:
-    """
-    使用方案A执行知识编辑：LoRA + KFac 边缘化投影 Adam 优化器。
-
-    与 execute_ft 的区别：
-      - 用 peft 库为模型添加 LoRA 适配器，原始权重全程冻结
-      - 将标准 Adam 替换为 ProjectedLoRAOptimizer：
-          lora_A 的梯度通过右投影（Ua / mask_a）投影到低能量安全子空间
-          lora_B 的梯度通过左投影（Ub / mask_b）投影到低能量安全子空间
-        从而保证每步更新只发生在对旧知识影响最小的方向上
-      - 训练完成后将 LoRA 权重合并回原始模型，返回普通模型
-    """
+    # 对于梯度进行投影
     tracker = kwargs.get("tracker", None)
     device = model.device
 
@@ -397,9 +391,6 @@ def execute_ft_mylora(
         model, tok, hparams
     )
 
-    # SchemeA 模式：跳过训练前的旧知识损失计算
-    # calculate_old_loss 每次需要在 Wikipedia 上跑 100 条前向传播（约 4~5 分钟），
-    # SchemeA 通过 KFac 投影在优化方向上已保证对旧知识影响最小，无需每步监控。
     if not getattr(hparams, "disable_old_loss_check", False):
         old_loss = calculate_old_loss(peft_model, tok, hparams)
         tracker.log(old_loss)
@@ -437,10 +428,6 @@ def execute_ft_mylora(
                 loss.backward()
                 opt.step()
 
-        # SchemeA 模式：跳过每步的旧知识损失计算（是性能瓶颈所在）
-        # calculate_old_loss 在 disable_old_loss_check=True 时会立即返回 {}，
-        # 但如果字段未同步到服务器，仍会执行完整的 Wikipedia 前向传播（4~5 分钟/步）。
-        # 因此这里用 getattr 做防御性检查，彻底规避。
         if not getattr(hparams, "disable_old_loss_check", False):
             metrics = calculate_old_loss(peft_model, tok, hparams)
             metrics.update({"FT LoRA Loss": loss_meter.avg})
@@ -456,3 +443,160 @@ def execute_ft_mylora(
     # 移除适配器结构，返回标准的 AutoModelForCausalLM。
     merged_model = peft_model.merge_and_unload()
     return merged_model
+
+
+def execute_ft_param_lora(
+    model: AutoModelForCausalLM,
+    tok: AutoTokenizer,
+    requests: List[Dict],
+    hparams: CrispLoRAHyperParams,
+    **kwargs: Any,
+) -> AutoModelForCausalLM:
+ # 对 LoRA 参数本身做曲率约束（CurvatureLora），使增量落在低曲率子空间
+    tracker = kwargs.get("tracker", None)
+    device = model.device
+
+    if tok.padding_side != "right":
+        tok.padding_side = "right"
+
+    requests = deepcopy(requests)
+    for i, request in enumerate(requests):
+        if request["target_new"] and request["target_new"][0] != " ":
+            requests[i]["target_new"] = " " + request["target_new"]
+
+    # Step 1: 计算 K-FAC 协方差  特征分解
+    layer_to_cov_cache_old = build_lora_projection_cache(model,tok,hparams)
+
+    # Step 2: 挂载标准 LoRA
+    model.config.use_cache = False
+    model.enable_input_require_grads()
+
+    peft_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        inference_mode=False,
+        r=hparams.lora_rank,
+        lora_alpha=hparams.lora_alpha,
+        lora_dropout=hparams.lora_dropout,
+        layers_to_transform=hparams.layers if len(hparams.layers) > 0 else None,
+        target_modules=hparams.target_modules,
+    )
+
+    peft_model = get_peft_model(model, peft_config)
+    peft_model.print_trainable_parameters()
+
+    adapter_name = "default"
+
+    # Step 3: 将标准 LoRA 层后挂载为 CurvatureLora variant
+    attach_curvature_lora_variant(peft_model, adapter_name=adapter_name)
+
+    # Step 4: 从 K-FAC 特征向量中提取高曲率方向基，写入每个 LoRA 层
+    # 高曲率方向 = 协方差特征值大的方向（eigh 升序，高能量列 mask_a==False 即为高曲率）
+    for name, module in peft_model.named_modules():
+        if not (
+            hasattr(module, "lora_A")
+            and hasattr(module, "lora_B")
+            and hasattr(module, "in_features")
+            and hasattr(module, "out_features")
+        ):
+            continue
+        if adapter_name not in getattr(module, "lora_variant", {}):
+            continue
+
+        matched_cache = None
+        for layer_name, cache in layer_to_cov_cache_old.items():
+            clean = layer_name[: -len(".weight")] if layer_name.endswith(".weight") else layer_name
+            if clean in name:
+                matched_cache = cache
+                break
+
+        if matched_cache is None:
+            continue
+
+        base_weight = module.base_layer.weight if hasattr(module, "base_layer") else module.weight
+        dev = base_weight.device
+        dtype = base_weight.dtype
+
+        # Ua 列按特征值升序排列；高曲率方向 = 高能量方向 = mask_a==False 的列
+        Ua = matched_cache["Ua"].to(device=dev, dtype=dtype)  # (d_in, d_in)
+        Ub = matched_cache["Ub"].to(device=dev, dtype=dtype)  # (d_out, d_out)
+        mask_a = matched_cache["mask_a"].to(device=dev)  # True = 低能量(安全)
+        mask_b = matched_cache["mask_b"].to(device=dev)
+
+        # 高曲率方向 = ~mask（不安全方向）
+        U_in_bar = Ua[:, ~mask_a]   # (d_in, k_in)
+        U_out_bar = Ub[:, ~mask_b]  # (d_out, k_out)
+
+        setattr(module, f"U_in_bar_{adapter_name}", U_in_bar)
+        setattr(module, f"U_out_bar_{adapter_name}", U_out_bar)
+
+    # Step 5: 构建普通 Adam 优化器（CurvatureLora 通过 forward 结构约束增量，无需特殊优化器）
+    opt = torch.optim.Adam(
+        [p for p in peft_model.parameters() if p.requires_grad],
+        lr=hparams.lr,
+        weight_decay=hparams.weight_decay,
+    )
+
+    if not getattr(hparams, "disable_old_loss_check", False):
+        old_loss = calculate_old_loss(peft_model, tok, hparams)
+        tracker.log(old_loss)
+
+    loss_meter = AverageMeter()
+    pbar = trange(hparams.num_steps)
+
+    for it in pbar:
+        loss_meter.reset()
+
+        random.shuffle(requests)
+        texts = [r["prompt"] for r in requests]
+        targets = [r["target_new"] for r in requests]
+
+        for txt, tgt in zip(
+            chunks(texts, hparams.batch_size), chunks(targets, hparams.batch_size)
+        ):
+            inputs_targets = [txt_ + tgt_ for txt_, tgt_ in zip(txt, tgt)]
+            encodings = tok(
+                inputs_targets,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=hparams.max_length,
+            ).to(device)
+
+            labels = encodings["input_ids"].clone()
+            labels[labels == tok.pad_token_id] = -100
+            for i, prompt in enumerate(txt):
+                prompt_len = len(
+                    tok(
+                        prompt,
+                        add_special_tokens=True,
+                        truncation=True,
+                        max_length=hparams.max_length,
+                    )["input_ids"]
+                )
+                labels[i, :prompt_len] = -100
+
+            opt.zero_grad(set_to_none=True)
+            outputs = peft_model(**encodings, labels=labels)
+            loss = outputs.loss
+
+            loss_meter.update(loss.item(), n=labels.size(0))
+
+            if loss.item() >= 1e-2:
+                loss.backward()
+                opt.step()
+
+        if not getattr(hparams, "disable_old_loss_check", False):
+            metrics = calculate_old_loss(peft_model, tok, hparams)
+            metrics.update({"FT ParamLoRA Loss": loss_meter.avg})
+            tracker.log(metrics)
+        else:
+            tracker.log({"FT ParamLoRA Loss": loss_meter.avg})
+
+        pbar.set_postfix({"loss": f"{loss_meter.avg:.4f}"})
+        if loss_meter.avg < 1e-2:
+            break
+
+    merged_model = peft_model.merge_and_unload()
+    return merged_model
+    
+    

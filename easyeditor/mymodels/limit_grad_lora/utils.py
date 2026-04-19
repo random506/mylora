@@ -22,8 +22,7 @@ from peft import LoraConfig, AdaLoraConfig, get_peft_model, TaskType
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from dotenv import load_dotenv
 
-from ..scheme_a_projected_lora.projected_lora_optimizer import ProjectedLoRAOptimizer
-from ..scheme_a_projected_lora.hparams import SchemeAHyperParams
+from .projected_lora_optimizer import ProjectedLoRAOptimizer
 from ...models.rome.layer_stats import layer_stats_kfac_one_pass
 
 load_dotenv()

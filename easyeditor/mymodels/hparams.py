@@ -1,16 +1,3 @@
-"""
-方案C超参数配置
-CrispEdit-LoRA联合框架（最完整方案）：
-  将KFac初始化（方案B）与ProjectedLoRAOptimizer（方案A）结合，
-  同时支持连续编辑时的动态协方差缓存更新（继承CrispEdit原有机制）。
-
-核心思路：
-  1. KFac低能量子空间初始化LoRA A/B矩阵（方案B的精华）
-  2. 用ProjectedLoRAOptimizer保证每一步梯度都投影到安全子空间（方案A的精华）
-  3. 连续编辑时动态更新协方差缓存 + 重置优化器投影（CrispEdit原有机制）
-  4. 支持混合数据（预训练数据 + 新编辑请求数据）计算联合协方差
-"""
-
 from dataclasses import dataclass, field
 from typing import List
 import yaml
@@ -65,6 +52,10 @@ class CrispLoRAHyperParams(HyperParams):
     projection_mode: str = "marginal_AB"
     # 是否归一化初始化
     normalize_init: bool = True
+
+
+    # --核心变化
+    projection_method: str = "param" 
 
     # ── 连续编辑配置（CrispEdit继承） ────────────────────────────────────────
     # 是否在权重显著变化时重新计算协方差缓存

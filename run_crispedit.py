@@ -98,25 +98,22 @@ def get_arguments():
                         default=["q_proj", "v_proj"],
                         help='Target modules for LoRA adaptation.')
 
-    # ── mylora 新参数 
-    parser.add_argument('--scheme', type=str, default=None,
-                        choices=['scheme_a', 'scheme_b', 'scheme_c'],
-                        help=(
-                            'Use a mymodels scheme instead of the built-in CrispEdit pipeline. '
-                            'scheme_a: LoRA + KFac projected Adam; '
-                            'scheme_b: CrispEdit-LoRA joint; '
-                            'scheme_c: adaptive-rank LoRA.'
-                        ))
+    # ── mylora 新参数
+    parser.add_argument('--projection_method', type=str, default=None,
+                        choices=["param","grad"],
+                        help="Projection onto the gradient or onto the parameters")
+    
     args = parser.parse_args()
     return args
 
 def get_hparams(args):
-    if args.scheme is not None:
+    if args.projection_method is not None:
         print(f"[run_crispedit] 加载 {args.scheme} 配置")
         hparams = CrispLoRAHyperParams.from_hparams(f"./hparams/MyLoRA/{args.model}")
         hparams.batch_size = args.batch_size
         hparams.energy_threshold = args.energy_threshold
         hparams.mom2_n_samples = args.cache_sample_num
+        
         if hasattr(hparams, 'disable_old_loss_check'):
             hparams.disable_old_loss_check = args.disable_old_loss_check
         if hasattr(hparams, 'recalculate_cache'):
@@ -169,8 +166,8 @@ def get_hparams(args):
     return hparams
 
 def calculate_model_name(args, hparams):
-    if args.scheme is not None:
-        alg = getattr(hparams, 'alg_name', args.scheme)
+    if args.projection_method is not None:
+        alg = getattr(hparams, 'alg_name', args.projection_method)
         name = f"{args.model}_{alg}_{args.data_type}_{args.energy_threshold}_{args.cache_sample_num}"
     elif args.perform_lora:
         name = f"{args.model}_LoRA_FT_{args.data_type}"
@@ -225,8 +222,11 @@ if __name__ == "__main__":
     print_time("Begin FT Time")
     if args.sequential_edit:
         edited_model = execute_ft_sequential(model, tokenizer, requests, hparams,tracker = tracker)
-    elif args.scheme is not None:
-        edited_model = execute_ft_mylora(model, tokenizer, requests, hparams,tracker = tracker)
+    elif args.projection_method is not None:
+        if args.projection_method == "param":
+            edited_model = execute_ft_param_lora(model, tokenizer, requests, hparams,tracker = tracker)
+        elif args.projection_method == "grad":
+            edited_model = execute_ft_grad_lora(model, tokenizer, requests, hparams,tracker = tracker)
     else:
         edited_model = execute_ft(model, tokenizer, requests, hparams,tracker = tracker)
     print_time("End FT Time")

@@ -30,11 +30,12 @@ mom2_n_samples: 10000
 mom2_dtype: "float32"
 energy_threshold: 0.99
 
-# 方案C特有：联合框架配置
-use_kfac_init: true          # 是否启用KFac初始化（方案B精华）
-use_projected_optimizer: true # 是否启用投影优化器（方案A精华）
+use_kfac_init: true          
+use_projected_optimizer: true 
 projection_mode: "marginal_AB"
 normalize_init: true
+# 核心变化
+projection_method: "param"  # 两种模式的投影，param对参数进行投影，grad对梯度进行投影
 
 # 连续编辑配置（继承CrispEdit）
 recalculate_cache: false      # 是否在权重变化时重新计算协方差
