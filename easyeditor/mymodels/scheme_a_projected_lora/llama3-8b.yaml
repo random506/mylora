@@ -1,0 +1,49 @@
+# 方案A配置：LoRA + KFac边缘化投影Adam
+# 适用于：希望在LoRA参数上施加严格子空间投影约束
+# 特点：训练时每步梯度都被投影到低能量安全子空间
+
+alg_name: "SchemeA_ProjectedLoRA"
+model_name: "/Meta-Llama-3-8B-Instruct"
+device: 0
+model_parallel: false
+
+# 编辑层（与CrispEdit保持一致）
+layers: [19, 20, 21, 22, 23]
+rewrite_module_tmp: "model.layers.{}.mlp.down_proj"
+layer_module_tmp: "model.layers.{}"
+mlp_module_tmp: "model.layers.{}.mlp"
+attn_module_tmp: "model.layers.{}.self_attn"
+ln_f_module: "model.norm"
+lm_head_module: "lm_head"
+
+# LoRA配置
+lora_type: "lora"
+lora_rank: 64
+lora_alpha: 32
+lora_dropout: 0.1
+target_modules: ["down_proj"]
+
+
+# 训练配置
+num_steps: 70
+lr: 5.0e-3
+weight_decay: 0
+batch_size: 32
+max_length: 50
+objective_optimization: "target_new"
+
+# KFac统计（与原CrispEdit保持一致）
+mom2_dataset: "wikipedia"
+mom2_n_samples: 10000
+mom2_dtype: "float32"
+energy_threshold: 0.5
+
+# 方案A特有：边缘化投影模式
+# "marginal_AB" : 同时对lora_A(右投影)和lora_B(左投影)做投影（推荐）
+# "marginal_A"  : 仅对lora_A做右投影
+# "marginal_B"  : 仅对lora_B做左投影
+projection_mode: "marginal_AB"
+normalize_init: false
+
+kl_factor: 0
+norm_constraint: false

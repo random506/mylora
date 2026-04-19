@@ -1,0 +1,53 @@
+alg_name: "CrispLoRA"
+model_name: "Meta-Llama-3-8B-Instruct"
+device: 0
+model_parallel: false
+
+layers: [19, 20, 21, 22, 23]
+rewrite_module_tmp: "model.layers.{}.mlp.down_proj"
+layer_module_tmp: "model.layers.{}"
+mlp_module_tmp: "model.layers.{}.mlp"
+attn_module_tmp: "model.layers.{}.self_attn"
+ln_f_module: "model.norm"
+lm_head_module: "lm_head"
+
+lora_type: "lora"
+lora_rank: 64
+lora_alpha: 32
+lora_dropout: 0.1
+target_modules: ["down_proj"]
+
+num_steps: 25
+lr: 5.0e-4
+weight_decay: 0
+batch_size: 32
+max_length: 40
+objective_optimization: "target_new"
+
+# K-FAC
+mom2_dataset: "wikipedia"
+mom2_n_samples: 10000
+mom2_dtype: "float32"
+energy_threshold: 0.99
+
+# 方案C特有：联合框架配置
+use_kfac_init: true          # 是否启用KFac初始化（方案B精华）
+use_projected_optimizer: true # 是否启用投影优化器（方案A精华）
+projection_mode: "marginal_AB"
+normalize_init: true
+
+# 连续编辑配置（继承CrispEdit）
+recalculate_cache: false      # 是否在权重变化时重新计算协方差
+recalculate_weight_threshold: 0.1  # 触发重新计算的权重变化阈值
+
+# 编辑数据的协方差风格
+# "pretrain_only" : 仅用预训练数据计算协方差（最简单）
+# "edit_only"     : 仅用编辑请求数据计算协方差
+# "mix"           : 混合预训练 + 编辑数据（最全面但最慢）
+edit_cache_style: "pretrain_only"
+edit_n_samples: 10
+
+disable_old_loss_check: true
+
+kl_factor: 0
+norm_constraint: false
