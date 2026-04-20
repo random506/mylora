@@ -100,7 +100,7 @@ def get_arguments():
 
     # ── mylora 新参数
     parser.add_argument('--projection_method', type=str, default=None,
-                        choices=["param","grad"],
+                        choices=["param","grad","both"],
                         help="Projection onto the gradient or onto the parameters")
     
     args = parser.parse_args()
@@ -113,6 +113,7 @@ def get_hparams(args):
         hparams.batch_size = args.batch_size
         hparams.energy_threshold = args.energy_threshold
         hparams.mom2_n_samples = args.cache_sample_num
+        hparams.projection_method = args.projection_method
         
         if hasattr(hparams, 'disable_old_loss_check'):
             hparams.disable_old_loss_check = args.disable_old_loss_check
@@ -227,6 +228,9 @@ if __name__ == "__main__":
             edited_model = execute_ft_param_lora(model, tokenizer, requests, hparams,tracker = tracker)
         elif args.projection_method == "grad":
             edited_model = execute_ft_grad_lora(model, tokenizer, requests, hparams,tracker = tracker)
+        elif args.projection_method == "both":
+            edited_model = execute_ft_both_lora(model, tokenizer, requests, hparams,tracker = tracker)
+
     else:
         edited_model = execute_ft(model, tokenizer, requests, hparams,tracker = tracker)
     print_time("End FT Time")

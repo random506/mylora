@@ -26,6 +26,7 @@ from easyeditor.mymodels import (
     wrap_model_and_build_projected_optimizer,
     build_lora_projection_cache,
     attach_curvature_lora_variant,
+    apply_leaky_lora_to_model,
 )
 from peft import LoraConfig, get_peft_model, TaskType
 
@@ -451,134 +452,6 @@ def execute_ft_param_lora(
     hparams: CrispLoRAHyperParams,
     **kwargs: Any,
 ) -> AutoModelForCausalLM:
-    """
-    基于 K-FAC 曲率感知的 LoRA 微调（CurvatureLora / ParamLora 方法）。
-
-    核心思想：
-        标准 LoRA 的参数更新 ΔW = B·A 可以在权重空间的任意方向移动，
-        容易损坏与已有知识相关的高曲率方向（Fisher 信息大的方向）。
-        本方法在挂载 LoRA 之前，先利用 K-FAC 对预训练模型的曲率进行
-        分析，得到每一层输入/输出的特征分解（Kronecker 因子的特征向量）。
-        随后通过 CurvatureLora variant 在 forward 过程中将 LoRA 增量
-        正交投影到"低曲率子空间"，从而在学习新知识的同时保护旧知识。
-
-    与 execute_ft_grad_lora 的区别：
-        - execute_ft_grad_lora：在梯度上做投影（梯度空间约束）。
-        - execute_ft_param_lora：在参数结构上做约束（forward 时增量被
-          限定在安全子空间内，无需修改优化器）。
-
-    数据流总览：
-    ┌──────────────────────────────────────────────────────────────────┐
-    │  输入                                                            │
-    │  model: 预训练 CausalLM（冻结基础权重）                          │
-    │  tok:   对应的 Tokenizer                                         │
-    │  requests: [{"prompt": str, "target_new": str}, ...]            │
-    │  hparams: LoRA rank/alpha/dropout、层选择、lr 等超参              │
-    └────────────────────────┬─────────────────────────────────────────┘
-                             │
-                             ▼
-    ┌──────────────────────────────────────────────────────────────────┐
-    │  Step 1: K-FAC 协方差缓存构建                                     │
-    │  build_lora_projection_cache(model, tok, hparams)               │
-    │    → 对目标层做一次前向，收集每层的 Kronecker 因子 (A_cov, B_cov)  │
-    │    → 对因子做特征分解，得到特征向量矩阵 Ua(d_in×d_in)、           │
-    │      Ub(d_out×d_out) 以及安全/危险方向掩码 mask_a、mask_b         │
-    │  输出: layer_to_cov_cache_old                                    │
-    │    { "layer.weight": {"Ua": Tensor, "Ub": Tensor,               │
-    │                        "mask_a": BoolTensor, "mask_b": BoolTensor} }│
-    └────────────────────────┬─────────────────────────────────────────┘
-                             │
-                             ▼
-    ┌──────────────────────────────────────────────────────────────────┐
-    │  Step 2: 挂载标准 LoRA（PEFT）                                   │
-    │  model.config.use_cache = False   # 关闭 KV cache 以支持梯度     │
-    │  model.enable_input_require_grads()                              │
-    │  LoraConfig(r, alpha, dropout, layers, target_modules)          │
-    │  peft_model = get_peft_model(model, peft_config)                │
-    │    → 在目标线性层外包裹 LoRA 结构:                                │
-    │      原始 W(d_out×d_in) 保持冻结                                 │
-    │      新增可训练: lora_A(r×d_in)，lora_B(d_out×r)                │
-    │      输出 = W·x + (lora_alpha/r) * lora_B·lora_A·x             │
-    └────────────────────────┬─────────────────────────────────────────┘
-                             │
-                             ▼
-    ┌──────────────────────────────────────────────────────────────────┐
-    │  Step 3: 将 LoRA 层升级为 CurvatureLora variant                  │
-    │  attach_curvature_lora_variant(peft_model, adapter_name)        │
-    │    → 在每个 LoRA 模块的 lora_variant 字典中注入新的 forward 钩子  │
-    │    → 新 forward: 增量 ΔW = B·A 先通过 U_out_bar / U_in_bar       │
-    │      做正交投影，确保更新落在"高曲率（危险）子空间"的正交补（      │
-    │      即低曲率安全子空间）                                         │
-    └────────────────────────┬─────────────────────────────────────────┘
-                             │
-                             ▼
-    ┌──────────────────────────────────────────────────────────────────┐
-    │  Step 4: 将曲率基向量注入每个 CurvatureLora 模块                  │
-    │  遍历 peft_model.named_modules():                                │
-    │    - 筛选同时具有 lora_A、lora_B、in_features、out_features 的层  │
-    │    - 在 layer_to_cov_cache_old 中匹配对应层名                    │
-    │    - 提取高曲率方向（~mask）:                                     │
-    │        U_in_bar  = Ua[:, ~mask_a]  # (d_in,  k_in)  输入高曲率基│
-    │        U_out_bar = Ub[:, ~mask_b]  # (d_out, k_out) 输出高曲率基│
-    │    - setattr 注入模块，供 CurvatureLora forward 使用              │
-    │  几何含义:                                                        │
-    │    mask==True  → 低能量（低曲率）方向 = 安全方向（可修改）         │
-    │    mask==False → 高能量（高曲率）方向 = 危险方向（应避开）         │
-    │    投影到危险方向的正交补 ≡ 只在安全子空间内更新权重               │
-    └────────────────────────┬─────────────────────────────────────────┘
-                             │
-                             ▼
-    ┌──────────────────────────────────────────────────────────────────┐
-    │  Step 5: 构建 Adam 优化器                                         │
-    │  只优化 requires_grad=True 的参数（即 lora_A、lora_B）            │
-    │  不需要特殊优化器——子空间约束已在 CurvatureLora forward 中实现     │
-    └────────────────────────┬─────────────────────────────────────────┘
-                             │
-                             ▼
-    ┌──────────────────────────────────────────────────────────────────┐
-    │  Step 6: 训练循环（num_steps 轮）                                 │
-    │  每轮:                                                            │
-    │    ① 随机打乱 requests                                            │
-    │    ② 按 batch_size 切分，拼接 prompt+target_new 作为输入          │
-    │       tokenize → input_ids, attention_mask                       │
-    │    ③ 构建 labels:                                                 │
-    │       - pad token 位置置 -100（不计算 loss）                      │
-    │       - prompt 长度内的 token 置 -100（只对 target 计算 loss）    │
-    │    ④ 前向: peft_model(**encodings, labels=labels)                │
-    │       → CurvatureLora forward 将增量投影到安全子空间              │
-    │       → 计算 CrossEntropy loss（仅在 target 位置）                │
-    │    ⑤ 若 loss >= 1e-2: 反向传播 + Adam step                       │
-    │    ⑥ 记录 metrics（旧数据 loss + 当前 FT ParamLoRA Loss）         │
-    │    ⑦ 若 loss_meter.avg < 1e-2 则提前停止                         │
-    └────────────────────────┬─────────────────────────────────────────┘
-                             │
-                             ▼
-    ┌──────────────────────────────────────────────────────────────────┐
-    │  Step 7: LoRA 权重合并与返回                                      │
-    │  peft_model.merge_and_unload()                                  │
-    │    → 将 (lora_alpha/r)*lora_B·lora_A 吸收回原始权重 W            │
-    │    → 移除 PEFT 适配器结构，返回标准 AutoModelForCausalLM          │
-    └──────────────────────────────────────────────────────────────────┘
-
-    Args:
-        model:    预训练的因果语言模型（权重将在原地被 LoRA 适配器修改）。
-        tok:      与 model 对应的分词器。
-        requests: 编辑请求列表，每项包含:
-                    - "prompt"     (str): 输入提示文本
-                    - "target_new" (str): 期望的新输出文本
-        hparams:  CrispLoRAHyperParams，包含:
-                    lora_rank, lora_alpha, lora_dropout,
-                    layers, target_modules, lr, weight_decay,
-                    batch_size, num_steps, max_length,
-                    disable_old_loss_check 等。
-        **kwargs: 可选关键字参数，目前支持:
-                    - tracker: 用于记录训练指标的 tracker 对象。
-
-    Returns:
-        merged_model (AutoModelForCausalLM):
-            已将 CurvatureLora 增量合并回基础权重的模型，
-            与输入 model 结构相同，无 PEFT 适配器层。
-    """
     tracker = kwargs.get("tracker", None)
     device = model.device
 
@@ -593,19 +466,8 @@ def execute_ft_param_lora(
         if request["target_new"] and request["target_new"][0] != " ":
             requests[i]["target_new"] = " " + request["target_new"]
 
-    # ------------------------------------------------------------------ #
-    # Step 1: 计算 K-FAC 协方差缓存并做特征分解
-    #   数据流: model + tok + hparams
-    #        → 对目标层前向一次，收集激活统计量
-    #        → 构建 Kronecker 因子并分解为 (Ua, Ub, mask_a, mask_b)
-    #        → 返回 {layer_name: {"Ua", "Ub", "mask_a", "mask_b"}}
-    # ------------------------------------------------------------------ #
     layer_to_cov_cache_old = build_lora_projection_cache(model, tok, hparams)
 
-    # ------------------------------------------------------------------ #
-    # Step 2: 挂载标准 LoRA 适配器
-    #   数据流: model → peft_model（基础权重冻结，新增 lora_A/lora_B 可训练）
-    # ------------------------------------------------------------------ #
     model.config.use_cache = False       # 关闭 KV cache，允许梯度回传
     model.enable_input_require_grads()   # 确保输入 embedding 支持梯度
 
@@ -624,25 +486,8 @@ def execute_ft_param_lora(
 
     adapter_name = "default"
 
-    # ------------------------------------------------------------------ #
-    # Step 3: 将标准 LoRA 升级为 CurvatureLora variant
-    #   数据流: peft_model → 各 LoRA 模块的 lora_variant 字典被填充
-    #           后续 forward 时，增量会被投影到安全子空间再叠加到输出
-    # ------------------------------------------------------------------ #
     attach_curvature_lora_variant(peft_model, adapter_name=adapter_name)
 
-    # ------------------------------------------------------------------ #
-    # Step 4: 将 K-FAC 高曲率基向量注入各 CurvatureLora 模块
-    #   数据流:
-    #     layer_to_cov_cache_old[layer_name] → matched_cache
-    #     matched_cache["Ua"] → Ua (d_in × d_in)   输入空间特征向量（升序）
-    #     matched_cache["Ub"] → Ub (d_out × d_out) 输出空间特征向量（升序）
-    #     ~mask_a → 高曲率（高能量）列索引
-    #     Ua[:, ~mask_a] → U_in_bar  (d_in, k_in)  高曲率输入基
-    #     Ub[:, ~mask_b] → U_out_bar (d_out, k_out) 高曲率输出基
-    #   注入后 CurvatureLora.forward 可利用这两组基构建正交投影，
-    #   将 ΔW 限制在 span(U_in_bar)⊥ ⊗ span(U_out_bar)⊥（安全子空间）
-    # ------------------------------------------------------------------ #
     for name, module in peft_model.named_modules():
         # 仅处理同时具备 lora_A/lora_B 且已被升级为 CurvatureLora 的模块
         if not (
@@ -688,11 +533,6 @@ def execute_ft_param_lora(
         setattr(module, f"U_in_bar_{adapter_name}",  U_in_bar)
         setattr(module, f"U_out_bar_{adapter_name}", U_out_bar)
 
-    # ------------------------------------------------------------------ #
-    # Step 5: 构建普通 Adam 优化器
-    #   只优化 lora_A / lora_B（基础权重已冻结）。
-    #   CurvatureLora 的子空间约束通过 forward 结构实现，无需特殊优化器。
-    # ------------------------------------------------------------------ #
     opt = torch.optim.Adam(
         [p for p in peft_model.parameters() if p.requires_grad],
         lr=hparams.lr,
@@ -704,23 +544,6 @@ def execute_ft_param_lora(
         old_loss = calculate_old_loss(peft_model, tok, hparams)
         tracker.log(old_loss)
 
-    # ------------------------------------------------------------------ #
-    # Step 6: 训练循环
-    #   数据流（单 batch）:
-    #     [prompt_i + target_new_i]  （字符串拼接）
-    #          │
-    #          ▼ tokenize（padding=right, truncation, max_length）
-    #     input_ids: (B, L)  attention_mask: (B, L)
-    #          │
-    #          ▼ 构造 labels（-100 遮蔽 pad 和 prompt 部分）
-    #     labels:    (B, L)  仅 target 位置有效
-    #          │
-    #          ▼ peft_model forward（CurvatureLora 在内部做子空间投影）
-    #     loss = CrossEntropy(logits[:, :-1], labels[:, 1:])
-    #          │
-    #          ▼ loss >= 1e-2 时反向传播 + Adam step
-    #     lora_A, lora_B 参数更新（增量保持在安全子空间内）
-    # ------------------------------------------------------------------ #
     loss_meter = AverageMeter()
     pbar = trange(hparams.num_steps)
 
@@ -785,13 +608,10 @@ def execute_ft_param_lora(
         if loss_meter.avg < 1e-2:
             break
 
-    # ------------------------------------------------------------------ #
-    # Step 7: 合并 LoRA 权重并返回标准模型
-    #   数据流: peft_model（带 CurvatureLora 适配器）
-    #        → ΔW = (lora_alpha/r) * lora_B·lora_A 被吸收进 W
-    #        → 去除 PEFT wrapper，返回与输入相同结构的 AutoModelForCausalLM
-    # ------------------------------------------------------------------ #
     merged_model = peft_model.merge_and_unload()
     return merged_model
     
     
+
+def execute_ft_both_lora():
+    ...

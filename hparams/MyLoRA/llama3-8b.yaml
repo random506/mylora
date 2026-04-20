@@ -1,4 +1,4 @@
-alg_name: "NewCrispLoRA"
+alg_name: "BothLoRA"
 model_name: "Meta-Llama-3-8B-Instruct"
 device: 0
 model_parallel: false
@@ -28,7 +28,7 @@ objective_optimization: "target_new"
 mom2_dataset: "wikipedia"
 mom2_n_samples: 10000
 mom2_dtype: "float32"
-energy_threshold: 0.99
+energy_threshold: 0.5
 
 use_kfac_init: true          
 use_projected_optimizer: true 
