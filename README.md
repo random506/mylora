@@ -153,10 +153,10 @@ python run_crispedit.py --model llama3-8b --data_type zsre --batch_size 32 --wan
 
 ```
 
-MyLoRA
+#### MyLoRA
 
-```shell
-python run_crispedit.py  --model llama3-8b --data_type zsre  --energy_threshold 0.3    --batch_size 32  --projection_method param --alg_name mylora
+  ```shell
+  python run_crispedit.py  --model llama3-8b --data_type zsre  --energy_threshold 0.5    --batch_size 32  --projection_method both --alg_name mylora
 
-```
+  ```
 

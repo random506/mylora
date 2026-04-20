@@ -34,14 +34,6 @@ STATS_DIR = os.getenv("STATS_DIR")
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _is_llama_or_phi(model_name: str) -> bool:
-    """
-    判断是否为 LLaMA / Phi 系列模型。
-    参照 crispedit/utils.py 的 A/B 交换逻辑：
-      LLaMA / phi：不交换（A=输入协方差, B=输出协方差）
-      其他（Qwen/Mistral 等）：交换 A/B
-    注意：model_name 是完整路径，如 "meta-llama/Meta-Llama-3-8B-Instruct"，
-    需要用关键字匹配而非完整字符串比较。
-    """
     lower = model_name.lower()
     return "llama" in lower or "phi" in lower
 

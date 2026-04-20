@@ -31,6 +31,9 @@ from .limit_param_lora import (
     attach_curvature_lora_variant
 )
 
+from .limit_lora import(
+  apply_leaky_lora_to_model
+)
 
 __all__ = [
     # 超参数

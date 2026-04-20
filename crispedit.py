@@ -613,5 +613,13 @@ def execute_ft_param_lora(
     
     
 
-def execute_ft_both_lora():
-    ...
+def execute_ft_both_lora(
+    model: AutoModelForCausalLM,
+    tok: AutoTokenizer,
+    requests: List[Dict],
+    hparams: CrispLoRAHyperParams,
+    **kwargs: Any,
+) -> AutoModelForCausalLM:
+    print("进入第一层函数 ......")
+    tracker = kwargs.get("tracker", None)
+    return apply_leaky_lora_to_model(model, tok, requests, hparams,tracker = tracker)

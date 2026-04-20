@@ -17,11 +17,13 @@ from typing import Dict, List, Tuple, Optional
 from peft import LoraConfig, get_peft_model, TaskType
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from dotenv import load_dotenv
+from copy import deepcopy
 
 from .LeakyCurvatureLora import LeakyCurvatureLora
 from .lora_optimizer import GlobalAwareProjectedLoRAOptimizer
 from ...models.rome.layer_stats import layer_stats_kfac_one_pass
 from ..hparams import CrispLoRAHyperParams
+from ..tools import *
 
 load_dotenv()
 STATS_DIR = os.getenv("STATS_DIR")
@@ -158,8 +160,10 @@ def inject_leaky_curvature_lora(
         ):
             continue
         if adapter_name not in module.lora_A or adapter_name not in module.lora_B:
+            print("[error] 163")
             continue
         if not hasattr(module, "lora_variant"):
+            print('[error] 166')
             continue
 
         # 注册 variant 并初始化 buffer + leak_rate
@@ -322,10 +326,6 @@ def wrap_model_and_build_leaky_optimizers(
     return peft_model, optimizer_lora, optimizer_leak, layer_to_proj_cache
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# 主训练函数（适配 EasyEditor 调用约定）
-# ═══════════════════════════════════════════════════════════════════════════
-
 def apply_leaky_lora_to_model(
     model: AutoModelForCausalLM,
     tok: AutoTokenizer,
@@ -346,15 +346,13 @@ def apply_leaky_lora_to_model(
     Returns:
         (edited_model, weights_copy)
     """
-    from copy import deepcopy
-
+    print("进入执行函数 ......")
     tracker = kwargs.get("tracker", None)
     device = model.device
 
     if tok.padding_side != "right":
         tok.padding_side = "right"
 
-    requests = deepcopy(requests)
     for i, request in enumerate(requests):
         if request["target_new"] and request["target_new"][0] != " ":
             requests[i]["target_new"] = " " + request["target_new"]
@@ -365,12 +363,7 @@ def apply_leaky_lora_to_model(
         model, tok, hparams
     )
 
-    device = next(peft_model.parameters()).device
-
-    texts = [
-        r["prompt"].format(r.get("subject", "")) if "{}" in r["prompt"] else r["prompt"]
-        for r in requests
-    ]
+    texts = [r["prompt"] for r in requests ]
     targets = [r["target_new"] for r in requests]
 
     peft_model.train()
@@ -393,6 +386,7 @@ def apply_leaky_lora_to_model(
             total_loss += loss.item()
 
         avg_loss = total_loss / max(1, len(texts) // hparams.batch_size)
+        tracker.log(f"LOSS:{avg_loss}")
         print(f"[LeakyLoRA] Step {step+1}/{hparams.num_steps}  loss={avg_loss:.4f}")
         if avg_loss < 1e-3:
             print("[LeakyLoRA] 损失收敛，提前结束训练")

@@ -4,7 +4,7 @@
 
 alg_name: "CRISPEDIT"
 device: 0
-model_name: "/Meta-Llama-3-8B-Instruct"
+model_name: "Meta-Llama-3-8B-Instruct"
 
 layers: [19, 20, 21, 22, 23]
 num_steps: 25

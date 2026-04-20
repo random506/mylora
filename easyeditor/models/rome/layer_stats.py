@@ -418,7 +418,7 @@ def layer_stats_kfac(
         
     A, B = A.to(model.device), B.to(model.device)
     return A, B
-#张
+
 def layer_stats_kfac_one_pass(
     model,
     tokenizer,
@@ -437,7 +437,7 @@ def layer_stats_kfac_one_pass(
     if model_name is None:
         model_name = model.config._name_or_path.rsplit("/")[-1]
     stats_dir = Path(stats_dir)
-    
+
     results = {}
     missing_layers = []
 
@@ -445,7 +445,6 @@ def layer_stats_kfac_one_pass(
         precision = "float64"
     dtype = getattr(torch, precision)
     size_suffix = "" if sample_size is None else f"_{sample_size}"
-
     # Check which layers are already cached
     for layer_name in layer_names:
         file_extension = f"{model_name}/{ds_name}_stats/{layer_name}_{precision}_kfac{size_suffix}.npz"
@@ -456,7 +455,6 @@ def layer_stats_kfac_one_pass(
             results[layer_name] = (loaded['A'].to(dtype=dtype), loaded['B'].to(dtype=dtype), loaded['N'])
         else:
             missing_layers.append(layer_name)
-
     if not missing_layers:
         return results
 
