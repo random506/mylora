@@ -1,8 +1,8 @@
 import torch
-from peft.tuners.lora.layer import LoraLayer, LoraVariant
+from peft.tuners.lora.layer import LoraLayer
+from peft import LoraConfig 
 
-
-class CurvatureLora(LoraVariant):
+class CurvatureLora(LoraConfig):
     """
     CurvatureLora：一种 LoRA 的变体。
 

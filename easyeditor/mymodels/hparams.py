@@ -8,7 +8,7 @@ from ..util.hparams import HyperParams
 @dataclass
 class CrispLoRAHyperParams(HyperParams):
     # ── 基本信息 ──────────────────────────────────────────────────────────────
-    alg_name: str = "CrispLoRA"
+    alg_name: str = "NewCrispLoRA"
     model_name: str = "meta-llama/Meta-Llama-3-8B-Instruct"
     device: int = 0
     model_parallel: bool = False

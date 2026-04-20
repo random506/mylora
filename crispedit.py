@@ -26,7 +26,6 @@ from easyeditor.mymodels import (
     wrap_model_and_build_projected_optimizer,
     build_lora_projection_cache,
     attach_curvature_lora_variant,
-    set_curvature_bases,
 )
 from peft import LoraConfig, get_peft_model, TaskType
 

@@ -24,7 +24,7 @@ from dotenv import load_dotenv
 
 from .projected_lora_optimizer import ProjectedLoRAOptimizer
 from ...models.rome.layer_stats import layer_stats_kfac_one_pass
-
+from ..hparams import CrispLoRAHyperParams
 load_dotenv()
 STATS_DIR = os.getenv("STATS_DIR")
 
@@ -110,7 +110,7 @@ def compute_marginal_masks(
 def build_lora_projection_cache(
     model: AutoModelForCausalLM,
     tok: AutoTokenizer,
-    hparams: SchemeAHyperParams,
+    hparams: CrispLoRAHyperParams,
     force_recompute: bool = False,
 ) -> Dict[str, Dict]:
     """
@@ -247,7 +247,7 @@ def map_proj_cache_to_lora_params(
 def wrap_model_and_build_projected_optimizer(
     model: AutoModelForCausalLM,
     tok: AutoTokenizer,
-    hparams: SchemeAHyperParams,
+    hparams: CrispLoRAHyperParams,
     force_recompute: bool = False,
 ):
     """
@@ -322,7 +322,7 @@ def apply_scheme_a_to_model(
     model: AutoModelForCausalLM,
     tok: AutoTokenizer,
     requests: List[Dict],
-    hparams: SchemeAHyperParams,
+    hparams: CrispLoRAHyperParams,
     copy: bool = False,
     return_orig_weights: bool = False,   # 保留以兼容 EasyEditor 调用约定，暂未使用
     keep_original_weight: bool = False,  # 保留以兼容 EasyEditor 调用约定，暂未使用
@@ -386,7 +386,7 @@ def _compute_loss(
     texts: List[str],
     targets: List[str],
     device: torch.device,
-    hparams: SchemeAHyperParams,
+    hparams: CrispLoRAHyperParams,
 ) -> torch.Tensor:
     """
     计算编辑损失，参照 crispedit.py 的 execute_ft 训练循环：

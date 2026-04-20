@@ -15,7 +15,7 @@ from utils import (
 HF_CACHE_DIR = os.getenv("HF_CACHE_DIR")
 os.environ["HF_DATASETS_CACHE"] = os.getenv("HF_DATASETS_DIR")
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1" 
+os.environ["CUDA_VISIBLE_DEVICES"] = "1,2" 
 
 import argparse
 import torch
@@ -59,7 +59,7 @@ def get_arguments():
                         help='Whether to use sequential editing. Default is False.')
     
     # wandb/swanlab
-    parser.add_argument('--wandb_project', type=str, default='CrispEdit',
+    parser.add_argument('--wandb_project', type=str, default='CrispLoRA',
                         help='project name.')
     parser.add_argument('--no_wandb', action='store_true',
                         help='Disable wandb logging.')
@@ -108,7 +108,7 @@ def get_arguments():
 
 def get_hparams(args):
     if args.projection_method is not None:
-        print(f"[run_crispedit] 加载 {args.scheme} 配置")
+        print(f"[run_crispedit] 加载 {args.projection_method} 配置")
         hparams = CrispLoRAHyperParams.from_hparams(f"./hparams/MyLoRA/{args.model}")
         hparams.batch_size = args.batch_size
         hparams.energy_threshold = args.energy_threshold

@@ -3,44 +3,10 @@ import torch.nn as nn
 from peft import LoraConfig, get_peft_model
 
 # 这里导入你自己的 CurvatureLora 实现
-from mylora import CurvatureLora
+from .CurvatureLora import CurvatureLora
 
 
-# =========================
-# 1. 一个简单的玩具模型
-# =========================
-class ToyModel(nn.Module):
-    def __init__(self, in_dim=16, hidden_dim=32, out_dim=8):
-        super().__init__()
-        self.fc1 = nn.Linear(in_dim, hidden_dim, bias=False)
-        self.act = nn.ReLU()
-        self.fc2 = nn.Linear(hidden_dim, out_dim, bias=False)
-
-    def forward(self, x):
-        x = self.fc1(x)
-        x = self.act(x)
-        x = self.fc2(x)
-        return x
-
-
-# =========================
-# 2. 生成一个随机正交基
-#    用来模拟 U_in_bar / U_out_bar
-# =========================
-def random_orthonormal_basis(dim: int, k: int, device, dtype):
-    """
-    返回形状 (dim, k) 的列正交矩阵。
-    若 k=0，则返回空基，表示“不做该侧投影”。
-    """
-    if k == 0:
-        return torch.zeros(dim, 0, device=device, dtype=dtype)
-
-    # 随机矩阵 -> QR 分解 -> 取 Q
-    x = torch.randn(dim, k, device=device, dtype=torch.float32)
-    q, _ = torch.linalg.qr(x, mode="reduced")
-    return q.to(dtype=dtype)
-
-
+#
 # =========================
 # 3. 将普通 LoRA 层“后挂载”为 CurvatureLora
 # =========================
