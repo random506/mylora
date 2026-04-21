@@ -449,13 +449,14 @@ def layer_stats_kfac_one_pass(
     for layer_name in layer_names:
         file_extension = f"{model_name}/{ds_name}_stats/{layer_name}_{precision}_kfac{size_suffix}.npz"
         filename = stats_dir / file_extension
-        
+        print(f"缓存路径为:{filename}")
         if filename.exists() and not force_recompute:
             loaded = torch.load(filename, map_location='cpu')
             results[layer_name] = (loaded['A'].to(dtype=dtype), loaded['B'].to(dtype=dtype), loaded['N'])
         else:
             missing_layers.append(layer_name)
     if not missing_layers:
+        print("已找到缓存！！！")
         return results
 
     # print(f"Recalculating KFAC for {len(missing_layers)} layers: {missing_layers}")

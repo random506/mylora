@@ -169,7 +169,7 @@ def get_hparams(args):
 def calculate_model_name(args, hparams):
     if args.projection_method is not None:
         alg = getattr(hparams, 'alg_name', args.projection_method)
-        name = f"{args.model}_{alg}_{args.data_type}_{args.energy_threshold}_{args.cache_sample_num}"
+        name = f"{args.model}_{args.projection_method}_{args.data_type}_{args.energy_threshold}_{args.cache_sample_num}"
     elif args.perform_lora:
         name = f"{args.model}_LoRA_FT_{args.data_type}"
     elif args.no_crisp:

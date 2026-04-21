@@ -163,8 +163,8 @@ def inject_leaky_curvature_lora(
             print("[error] 163")
             continue
         if not hasattr(module, "lora_variant"):
-            print('[error] 166')
-            continue
+            module.lora_variant = {}  # 初始化容器
+            print("初始化容器")
 
         # 注册 variant 并初始化 buffer + leak_rate
         module.lora_variant[adapter_name] = LeakyCurvatureLora()
@@ -386,14 +386,14 @@ def apply_leaky_lora_to_model(
             total_loss += loss.item()
 
         avg_loss = total_loss / max(1, len(texts) // hparams.batch_size)
-        tracker.log(f"LOSS:{avg_loss}")
+        tracker.log({"LOSS":avg_loss})
         print(f"[LeakyLoRA] Step {step+1}/{hparams.num_steps}  loss={avg_loss:.4f}")
         if avg_loss < 1e-3:
             print("[LeakyLoRA] 损失收敛，提前结束训练")
             break
 
     peft_model = peft_model.merge_and_unload()
-    return peft_model, weights_copy
+    return peft_model
 
 
 def _compute_loss(

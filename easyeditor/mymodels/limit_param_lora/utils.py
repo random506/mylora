@@ -27,8 +27,7 @@ def attach_curvature_lora_variant(peft_model, adapter_name="default"):
 
             # 如果没有 lora_variant 字典，就跳过
             if not hasattr(module, "lora_variant"):
-                print("[ERROR]: ")
-                continue
+                module.lora_variant = {}  # 初始化容器
 
             # 后挂载 CurvatureLora
             module.lora_variant[adapter_name] = CurvatureLora()
