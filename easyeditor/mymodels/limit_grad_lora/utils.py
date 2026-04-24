@@ -1,20 +1,3 @@
-"""
-方案A工具函数
-=====================================================
-负责：
-1. 从KFac协方差矩阵构建LoRA参数专用的边缘化投影缓存
-2. 包装模型为LoRA + ProjectedLoRAOptimizer
-3. 提供训练主循环
-
-与 easyeditor/models/crispedit/utils.py 的对齐说明：
-  - layer_stats_kfac_one_pass 返回的 key 与传入的 layer_names 完全一致，
-    因此 rewrite_module_tmp 应与 CrispEdit yaml 保持一致（带 .weight 后缀）。
-  - A/B 交换逻辑参照 CrispEdit：用 model_name 关键字判断而非完整路径。
-  - A/B 含义：layer_stats_kfac_one_pass 返回 (A=输入协方差, B=输出协方差, n)，
-    对于 LLaMA/phi，A 对应 d_in 维度（右投影用 Ua），B 对应 d_out 维度（左投影用 Ub）；
-    对于其他模型（Qwen/Mistral 等），A/B 顺序相反，需要交换。
-"""
-
 import os
 import torch
 from typing import Dict, List, Tuple, Optional
