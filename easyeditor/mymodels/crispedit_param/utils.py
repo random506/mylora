@@ -125,7 +125,7 @@ def calculate_projection_caches_from_cov_caches(
         B = cov_cache["B"].to(model.device)
 
         # 非 Llama/phi 类模型需要交换 A/B（与原 crispedit 保持一致）
-        if hparams.model_name not in ["Llama3-8B", "phi-1.5"]:
+        if hparams.model_name.lower() not in ["llama3-8b", "phi-1.5"]:
             A, B = B, A
 
         proj_cache = calculate_projection_cache_with_kfac(A, B, energy_threshold)
