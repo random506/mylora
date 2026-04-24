@@ -58,10 +58,10 @@ class LeakyCurvatureLora(LoraConfig):
         weight_B = module.lora_B[active_adapter].weight
         scaling = module.scaling[active_adapter]
         
-        leak = torch.sigmoid(getattr(module, f"leak_rate_{active_adapter}")) * 0.1
-        
+        device = weight_B.device
         dtype = weight_B.dtype
-        U_in_bar, U_out_bar = U_in_bar.to(dtype), U_out_bar.to(dtype)
+        leak = torch.sigmoid(getattr(module, f"leak_rate_{active_adapter}").to(device=device)) * 0.1
+        U_in_bar, U_out_bar = U_in_bar.to(device=device, dtype=dtype), U_out_bar.to(device=device, dtype=dtype)
         
         BA = weight_B @ weight_A
         

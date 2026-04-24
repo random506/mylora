@@ -12,6 +12,7 @@ Leaky曲率投影LoRA工具函数
 """
 
 import os
+import math
 import torch
 from typing import Dict, List, Tuple, Optional
 from peft import LoraConfig, get_peft_model, TaskType
@@ -204,6 +205,59 @@ def _match_layer_cache(param_name: str, layer_to_proj_cache: Dict[str, Dict]) ->
     return None
 
 
+def merge_leaky_lora_into_base(
+    peft_model,
+    adapter_name: str = "default",
+) -> None:
+    """
+    在调用 PEFT 的 merge_and_unload() 之前，手动将带曲率投影的 delta weight
+    预先合并进 base_layer.weight，然后将 lora_A / lora_B 权重清零。
+
+    【为什么需要这一步】
+    PEFT 的 merge() 内部调用的是自己的 get_delta_weight()：
+        delta = B @ A * scaling
+    它完全不知道 LeakyCurvatureLora 的存在，因此合并进去的增量
+    没有任何曲率投影保护（即训练时的约束在合并后全部丢失）。
+
+    解决方案：
+        1. 用 LeakyCurvatureLora._compute_delta_weight() 计算正确的投影 delta
+        2. 手动将 delta 加到 base_layer.weight
+        3. 将 lora_A / lora_B 权重清零
+    这样 PEFT 自己的 merge() 算出的增量 = B(0) @ A(0) * scaling = 0，
+    base_layer.weight 最终包含的就是正确的带投影结果。
+    """
+    count = 0
+    for name, module in peft_model.named_modules():
+        # 只处理挂了 LeakyCurvatureLora variant 的层
+        if not hasattr(module, "lora_variant"):
+            continue
+        if adapter_name not in module.lora_variant:
+            continue
+        if adapter_name not in module.lora_A or adapter_name not in module.lora_B:
+            continue
+
+        # 取 base_layer.weight
+        base_layer = module.base_layer if hasattr(module, "base_layer") else module
+        base_weight = base_layer.weight
+
+        # 用带投影的公式计算正确的 delta
+        with torch.no_grad():
+            delta = LeakyCurvatureLora._compute_delta_weight(module, adapter_name)
+            # delta 的形状已经是 [out_features, in_features]，与 base_weight 一致
+            base_weight.data += delta.to(dtype=base_weight.dtype)
+
+            # 清零 lora_A / lora_B，使 PEFT 自己的 merge 计算 B@A=0，不产生额外增量
+            module.lora_A[adapter_name].weight.data.zero_()
+            module.lora_B[adapter_name].weight.data.zero_()
+
+        count += 1
+        print(
+            f"[LeakyLoRA] 手动合并层 {name}：delta norm={delta.norm().item():.6f}"
+        )
+
+    print(f"[LeakyLoRA] merge_leaky_lora_into_base 完成，共处理 {count} 层")
+
+
 
 def map_proj_cache_to_lora_params(
     peft_model,
@@ -385,13 +439,19 @@ def apply_leaky_lora_to_model(
 
             total_loss += loss.item()
 
-        avg_loss = total_loss / max(1, len(texts) // hparams.batch_size)
+        # 修复：用 ceil 而非整除，保证实际 batch 数正确（含尾部不满批次）
+        num_batches = max(1, math.ceil(len(texts) / hparams.batch_size))
+        avg_loss = total_loss / num_batches
         tracker.log({"LOSS":avg_loss})
         print(f"[LeakyLoRA] Step {step+1}/{hparams.num_steps}  loss={avg_loss:.4f}")
         if avg_loss < 1e-3:
             print("[LeakyLoRA] 损失收敛，提前结束训练")
             break
 
+    # 先手动将带曲率投影的 delta 合并进 base_layer.weight，并清零 lora_A/lora_B。
+    # 这样 PEFT 自己的 merge_and_unload() 计算 B@A*scaling=0，不会覆盖正确结果。
+    # 若直接调用 merge_and_unload()，PEFT 会用无投影的 B@A 合并，训练时的保护全部丢失。
+    merge_leaky_lora_into_base(peft_model, adapter_name="default")
     peft_model = peft_model.merge_and_unload()
     return peft_model
 

@@ -79,8 +79,10 @@ class GlobalAwareProjectedLoRAOptimizer(Adam):
         重新触发预加载，保证矩阵始终在 GPU 上。
         """
         # 先同步动量（用旧 cache 里已在 GPU 上的矩阵）
+        # 将旧动量投影到新子空间，防止跨编辑的动量污染危险方向
         for group in self.param_groups:
             old_cache_map = group.get("projection_cache_map", {})
+            penalty = group.get("subspace_penalty", 0.1)
             for p in group["params"]:
                 if p not in self.state or p not in old_cache_map:
                     continue
@@ -90,7 +92,11 @@ class GlobalAwareProjectedLoRAOptimizer(Adam):
                     continue
                 m = state["exp_avg"]
                 param_type = cache.get("param_type", "unknown")
-                m_proj = self._project_grad(m, cache, param_type, group["projection_mode"])
+                # 修复：原来调用的 _project_grad 方法不存在，
+                # 应改为 _project_grad_with_global_awareness，并补全所有参数
+                m_proj = self._project_grad_with_global_awareness(
+                    p, m, cache, param_type, group["projection_mode"], penalty
+                )
                 if m_proj is not None:
                     m.copy_(m_proj)
 
@@ -167,5 +173,4 @@ class GlobalAwareProjectedLoRAOptimizer(Adam):
                 )
                 if grad_proj is not None:
                     p.grad.copy_(grad_proj)
-
-        return super().step(closure)
+        return super().step(None)

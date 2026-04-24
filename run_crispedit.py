@@ -114,7 +114,8 @@ def get_hparams(args):
         hparams.energy_threshold = args.energy_threshold
         hparams.mom2_n_samples = args.cache_sample_num
         hparams.projection_method = args.projection_method
-        
+        #临时增加，修改rank
+        hparams.lora_rank=args.lora_rank
         if hasattr(hparams, 'disable_old_loss_check'):
             hparams.disable_old_loss_check = args.disable_old_loss_check
         if hasattr(hparams, 'recalculate_cache'):

@@ -13,8 +13,8 @@ lm_head_module: "lm_head"
 
 lora_type: "lora"
 lora_rank: 64
-lora_alpha: 32
-lora_dropout: 0.1
+lora_alpha: 64
+lora_dropout: 0
 target_modules: ["down_proj"]
 
 num_steps: 25
