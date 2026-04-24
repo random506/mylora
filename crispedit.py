@@ -623,3 +623,15 @@ def execute_ft_both_lora(
     print("进入第一层函数 ......")
     tracker = kwargs.get("tracker", None)
     return apply_leaky_lora_to_model(model, tok, requests, hparams,tracker = tracker)
+'''
+    调用示例
+    --------
+    from easyeditor.mymodels.crispedit_param import (
+        CrispEditParamHyperParams,
+        execute_crispedit_param,
+    )
+
+    hparams = CrispEditParamHyperParams.from_hparams("hparams/CRISPEDIT_PARAM/llama3-8b.yaml")
+    requests = [{"prompt": "The capital of France is", "target_new": " Paris"}]
+    model = execute_crispedit_param(model, tok, requests, hparams)
+'''

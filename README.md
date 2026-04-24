@@ -151,12 +151,14 @@ python run_crispedit.py --model llama3-8b --data_type zsre --batch_size 32 --wan
   python run_base_benchmarks.py --edited_model_dir llama3-8b_CrispEdit_safeedit_train_0.95/ --model_name llama3-8b --alg_name Base --data_type safeedit_test --eval_num 20
   ``` -->
 
-```
-
 #### MyLoRA
 
   ```shell
-  python run_crispedit.py  --model llama3-8b --data_type zsre  --energy_threshold 0.5    --batch_size 32  --projection_method both --alg_name mylora
-
+  python run_crispedit.py  --model llama3-8b --data_type zsre  --energy_threshold 0.5    --batch_size 32  --projection_method_lora both --alg_name mylora
   ```
 
+#### Myedit
+
+  ```shell
+  python run_crispedit.py  --model llama3-8b --data_type zsre  --energy_threshold 0.5    --batch_size 32  --projection_method param --alg_name mylora
+  ```

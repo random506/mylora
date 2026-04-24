@@ -24,6 +24,11 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from easyeditor.models.crispedit.CrispEdit_hparams import CrispEditHyperParams
 from easyeditor.mymodels.hparams import CrispLoRAHyperParams
 
+from easyeditor.mymodels.crispedit_param import (
+        CrispEditParamHyperParams,
+        execute_crispedit_param,
+    )
+
 SEED = 69
 random.seed(SEED)
 np.random.seed(SEED)
@@ -99,6 +104,9 @@ def get_arguments():
                         help='Target modules for LoRA adaptation.')
 
     # ── mylora 新参数
+    parser.add_argument('--projection_method_lora', type=str, default=None,
+                        choices=["param","grad","both"],
+                        help="Projection onto the gradient or onto the parameters")
     parser.add_argument('--projection_method', type=str, default=None,
                         choices=["param","grad","both"],
                         help="Projection onto the gradient or onto the parameters")
@@ -107,13 +115,13 @@ def get_arguments():
     return args
 
 def get_hparams(args):
-    if args.projection_method is not None:
-        print(f"[run_crispedit] 加载 {args.projection_method} 配置")
+    if args.projection_method_lora is not None:
+        print(f"[run_crispedit] 加载 MyLoRA 配置")
         hparams = CrispLoRAHyperParams.from_hparams(f"./hparams/MyLoRA/{args.model}")
         hparams.batch_size = args.batch_size
         hparams.energy_threshold = args.energy_threshold
         hparams.mom2_n_samples = args.cache_sample_num
-        hparams.projection_method = args.projection_method
+        hparams.projection_method_lora = args.projection_method_lora
         #临时增加，修改rank
         hparams.lora_rank=args.lora_rank
         if hasattr(hparams, 'disable_old_loss_check'):
@@ -133,8 +141,15 @@ def get_hparams(args):
             hparams.num_edits = args.num_edits
 
         return hparams
+    elif args.projection_method is not None:
+        print(f"[run_crispedit] 加载 MyEdit 配置")
+        hparams = CrispEditParamHyperParams.from_hparams(f"./hparams/MyEdit/{args.model}")
+        hparams.batch_size = args.batch_size
+        hparams.energy_threshold = args.energy_threshold
+        hparams.mom2_n_samples = args.cache_sample_num
+        hparams.projection_method_lora = args.projection_method_lora
 
-    # ── 原有 CrispEdit 路径 ────────────────────────────────────────────────────
+    print(f"[run_crispedit] 加载 CrispEdit 配置")
     hparams = CrispEditHyperParams.from_hparams(f"./hparams/CrispEdit/{args.model}")
     hparams.batch_size = args.batch_size
     hparams.energy_threshold = args.energy_threshold
@@ -168,7 +183,10 @@ def get_hparams(args):
     return hparams
 
 def calculate_model_name(args, hparams):
-    if args.projection_method is not None:
+    if args.projection_method_lora is not None:
+        alg = getattr(hparams, 'alg_name', args.projection_method_lora)
+        name = f"{args.model}_{args.projection_method_lora}_{args.data_type}_{args.energy_threshold}_{args.cache_sample_num}"
+    elif args.projection_method is not None:
         alg = getattr(hparams, 'alg_name', args.projection_method)
         name = f"{args.model}_{args.projection_method}_{args.data_type}_{args.energy_threshold}_{args.cache_sample_num}"
     elif args.perform_lora:
@@ -224,13 +242,18 @@ if __name__ == "__main__":
     print_time("Begin FT Time")
     if args.sequential_edit:
         edited_model = execute_ft_sequential(model, tokenizer, requests, hparams,tracker = tracker)
+    elif args.projection_method_lora is not None:
+        if args.projection_method_lora == "param":
+            edited_model = execute_ft_param_lora(model, tokenizer, requests, hparams,tracker = tracker)
+        elif args.projection_method_lora == "grad":
+            edited_model = execute_ft_grad_lora(model, tokenizer, requests, hparams,tracker = tracker)
+        elif args.projection_method_lora == "both":
+            edited_model = execute_ft_both_lora(model, tokenizer, requests, hparams,tracker = tracker)
     elif args.projection_method is not None:
         if args.projection_method == "param":
-            edited_model = execute_ft_param_lora(model, tokenizer, requests, hparams,tracker = tracker)
-        elif args.projection_method == "grad":
-            edited_model = execute_ft_grad_lora(model, tokenizer, requests, hparams,tracker = tracker)
+            edited_model = execute_crispedit_param(model, tokenizer, requests, hparams,tracker = tracker)
         elif args.projection_method == "both":
-            edited_model = execute_ft_both_lora(model, tokenizer, requests, hparams,tracker = tracker)
+            ...
 
     else:
         edited_model = execute_ft(model, tokenizer, requests, hparams,tracker = tracker)

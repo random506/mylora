@@ -1,0 +1,55 @@
+# CrispEditParam — Qwen2.5-7B-Instruct
+# 核心思路：直接优化目标层原始权重 W，通过 ProjectedAdam 将参数变化 ΔW
+# 约束在 KFAC 曲率的低曲率子空间内，保护已学知识不被遗忘。
+#
+# objective_optimization:
+#   prompt_last  —— 仅对输入最后一个 token 计算 NLL（ROME 原版做法）
+#   target_new   —— 标准自回归交叉熵（推荐）
+
+alg_name: "CRISPEDIT_PARAM"
+device: 0
+model_name: "Qwen2.5-7B"
+
+# 目标编辑层（Qwen2.5-7B 共 28 层，中段 MLP 对事实存储贡献最大）
+layers: [15, 16, 17, 18, 19]
+rewrite_module_tmp: "model.layers.{}.mlp.down_proj"
+layer_module_tmp: "model.layers.{}"
+mlp_module_tmp: "model.layers.{}.mlp"
+attn_module_tmp: "model.layers.{}.self_attn"
+ln_f_module: "model.norm"
+lm_head_module: "lm_head"
+
+# 优化超参数
+num_steps: 25
+lr: 5.0e-4
+weight_decay: 0
+kl_factor: 0
+norm_constraint: false
+batch_size: 32
+max_length: 40
+model_parallel: false
+objective_optimization: "target_new"
+
+# KFAC 协方差统计（用于计算曲率投影基）
+mom2_dataset: "wikipedia"
+mom2_n_samples: 10000
+mom2_dtype: "float32"
+
+# 能量阈值：低曲率子空间保留的能量比例
+# Qwen 的隐藏维度更大，协方差矩阵更密集，阈值可适当放宽
+energy_threshold: 0.8
+
+# CrispEdit 投影开关
+no_crisp: false
+
+# 连续编辑：权重变化超过阈值时自动重算协方差缓存
+recalculate_cache: false
+recalculate_weight_threshold: 0.01
+
+# 编辑请求样本数及协方差融合策略
+# edit_cache_style: "new"  —— 仅用编辑请求样本
+#                  "mix"  —— 混合预训练数据
+edit_n_samples: 10
+edit_cache_style: "new"
+
+disable_old_loss_check: true

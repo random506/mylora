@@ -27,13 +27,6 @@ class CrispEditParamHyperParams(HyperParams):
     model_name: str
     objective_optimization: str
 
-    # LoRA config
-    lora_rank: int
-    lora_alpha: float
-    lora_dropout: float
-    target_modules: List[str]
-    lora_type: str = "lora"
-
     # Statistics
     mom2_dataset: str = ""
     mom2_n_samples: int = 1000

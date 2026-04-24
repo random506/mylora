@@ -1,29 +1,21 @@
 import gc
+import random
+from copy import deepcopy
+from typing import Any, Dict, List, Tuple, Optional
+
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from peft import LoraConfig, get_peft_model, TaskType
-from peft.tuners.lora.layer import LoraLayer
-from typing import Dict, List, Tuple, Optional
 from dotenv import load_dotenv
 import os
 
-from ..limit_param_lora.CurvatureLora import CurvatureLora
 from .CrispEditParam_hparams import CrispEditParamHyperParams
 from ...models.rome.layer_stats import (
-    layer_stats_kfac,
     layer_stats_kfac_one_pass,
-    layer_stats_kfac_with_txt_tgt,
-    calculate_cache_loss,
-    calculate_request_loss,
 )
 
 load_dotenv()
 STATS_DIR = os.getenv("STATS_DIR")
 
-
-# ---------------------------------------------------------------------------
-# 特征值分析工具
-# ---------------------------------------------------------------------------
 
 def get_rank_and_threshold_by_energy_ratio(eigenvalues: torch.Tensor, percent: float = 0.9):
     """按累积能量比例确定保留的特征值数量及对应阈值。"""
@@ -37,65 +29,20 @@ def get_rank_and_threshold_by_energy_ratio(eigenvalues: torch.Tensor, percent: f
 
 
 def calculate_projection_cache_with_kfac(A: torch.Tensor, B: torch.Tensor, energy_threshold: float = 0.9) -> Dict:
-    """
-    用 KFAC 协方差矩阵 A（输入侧）和 B（输出侧）计算曲率投影基。
+    # 特征分解、计算掩码矩阵
+    Sa, Ua = torch.linalg.eigh(A)  
+    Sb, Ub = torch.linalg.eigh(B)
 
-    返回：
-        {
-            'U_in_bar':  (in_features,  k_in)   输入侧高曲率方向基
-            'U_out_bar': (out_features, k_out)  输出侧高曲率方向基
-        }
-
-    这里高曲率方向 = 外积特征值大的方向，即 M >= null_threshold 的方向。
-    与 projected_adam 的 M（低曲率掩码）方向相反：
-        projected_adam: M = (Sa ⊗ Sb) < threshold  → 保留低曲率
-        curvature_lora: U_in_bar/U_out_bar 存的是"高曲率列" → forward 里减去它们
-    """
-    Sa, Ua = torch.linalg.eigh(A)   # A 是输入侧协方差，特征值升序
-    Sb, Ub = torch.linalg.eigh(B)   # B 是输出侧协方差
-
-    # 外积能量矩阵，(in_dim, out_dim)
-    M_energy = torch.outer(Sa, Sb)
-    _, null_threshold = get_rank_and_threshold_by_energy_ratio(
-        M_energy.view(-1), percent=energy_threshold
-    )
-
-    # 高曲率列 = 该侧特征值超过阈值的列（边际阈值近似）
-    high_in_mask  = Sa >= null_threshold.item() if isinstance(null_threshold, torch.Tensor) else Sa >= null_threshold
-    high_out_mask = Sb >= null_threshold.item() if isinstance(null_threshold, torch.Tensor) else Sb >= null_threshold
-
-    U_in_bar  = Ua[:, high_in_mask]   # (in_features,  k_in)
-    U_out_bar = Ub[:, high_out_mask]  # (out_features, k_out)
+    M = torch.outer(Sa, Sb)          # (d_in, d_out)，联合曲率
+    rank, null_threshold = get_rank_and_threshold_by_energy_ratio(M.view(-1), percent=energy_threshold)
+    M = (M < null_threshold).float()  # 1.0 = 安全方向，0.0 = 危险方向
 
     print(
-        f"[CrispEditParam] k_in={U_in_bar.shape[1]}/{Ua.shape[1]}, "
-        f"k_out={U_out_bar.shape[1]}/{Ub.shape[1]}, threshold={null_threshold:.4g}"
+        f"[CrispEditParam] safe rank={rank}/{Sa.shape[0] * Sb.shape[0]}, "
+        f"null_threshold={null_threshold:.6f}"
     )
-    return {"U_in_bar": U_in_bar, "U_out_bar": U_out_bar}
+    return {"Ua": Ua, "Ub": Ub, "M": M}
 
-
-# ---------------------------------------------------------------------------
-# 协方差统计获取
-# ---------------------------------------------------------------------------
-
-def get_cov_ab(
-    model: AutoModelForCausalLM,
-    tok: AutoTokenizer,
-    layer_name: str,
-    mom2_dataset: str,
-    mom2_n_samples: int,
-    mom2_dtype: str,
-    force_recompute: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """获取单个层的 KFAC 输入/输出协方差矩阵 (A, B)。"""
-    A, B = layer_stats_kfac(
-        model, tok, layer_name, STATS_DIR, mom2_dataset,
-        to_collect=["mom2"],
-        sample_size=mom2_n_samples,
-        precision=mom2_dtype,
-        force_recompute=force_recompute,
-    )
-    return A, B
 
 
 def calculate_cov_cache_with_old_data(
@@ -104,7 +51,7 @@ def calculate_cov_cache_with_old_data(
     hparams: CrispEditParamHyperParams,
     force_recompute: bool = False,
 ) -> Dict[str, Dict]:
-    """用预训练数据（旧数据）一次性计算所有目标层的协方差缓存，返回 {layer_name → {A, B, num_samples}}。"""
+    # 计算协方差矩阵
     if hparams.no_crisp:
         return None
 
@@ -137,46 +84,9 @@ def calculate_cov_cache_with_old_data(
     return layer_to_cov_cache
 
 
-def calculate_cov_cache_with_request(
-    txt, tgt,
-    model: AutoModelForCausalLM,
-    tok: AutoTokenizer,
-    hparams: CrispEditParamHyperParams,
-) -> Dict[str, Dict]:
-    """用编辑请求样本（txt/tgt）计算各目标层的协方差缓存，支持与预训练数据混合。"""
-    if hparams.no_crisp:
-        return None
-
-    cov_stats_dict = layer_stats_kfac_with_txt_tgt(
-        model, tok,
-        layer_names=[hparams.rewrite_module_tmp.format(l) for l in hparams.layers],
-        txt=txt, tgt=tgt, precision=hparams.mom2_dtype,
-        sample_size=hparams.edit_n_samples, to_collect=["mom2"],
-        add_pretrain_data=(hparams.edit_cache_style == "mix"),
-        pretrain_sample_size=hparams.mom2_n_samples,
-    )
-
-    layer_to_cov_cache = {}
-    for layer_num in hparams.layers:
-        layer_name = hparams.rewrite_module_tmp.format(layer_num)
-        A, B, num_samples = cov_stats_dict.pop(layer_name)
-        layer_to_cov_cache[layer_name] = {
-            "A": A.to("cpu", dtype=torch.float32),
-            "B": B.to("cpu", dtype=torch.float32),
-            "num_samples": num_samples,
-        }
-        del A, B
-        torch.cuda.empty_cache()
-
-    return layer_to_cov_cache
-
-
-# ---------------------------------------------------------------------------
-# 协方差缓存合并
-# ---------------------------------------------------------------------------
 
 def combine_layer_to_cov_caches(layer_to_cov_caches: List[Dict[str, Dict]]) -> Dict[str, Dict]:
-    """将多组协方差缓存按样本数加权平均，合并为一组。"""
+    # 针对于num_samples，可对协方差矩阵求均值
     if len(layer_to_cov_caches) == 1:
         return layer_to_cov_caches[0]
 
@@ -195,174 +105,45 @@ def combine_layer_to_cov_caches(layer_to_cov_caches: List[Dict[str, Dict]]) -> D
     return combined
 
 
-# ---------------------------------------------------------------------------
-# CurvatureLora 附加与更新
-# ---------------------------------------------------------------------------
-
-def _iter_lora_layers(peft_model, adapter_name: str):
-    """遍历 peft_model 中所有注入了指定 adapter 的 LoraLayer。"""
-    for name, module in peft_model.named_modules():
-        if (
-            hasattr(module, "lora_A")
-            and hasattr(module, "lora_B")
-            and hasattr(module, "in_features")
-            and hasattr(module, "out_features")
-            and adapter_name in module.lora_A
-            and adapter_name in module.lora_B
-        ):
-            yield name, module
-
-
-def attach_curvature_lora(peft_model, adapter_name: str = "default") -> int:
-    """
-    对 peft_model 中所有 LoraLayer 注册 CurvatureLora variant 和空投影基 buffer。
-    返回挂载层数。
-    """
-    count = 0
-    for _, module in _iter_lora_layers(peft_model, adapter_name):
-        if not hasattr(module, "lora_variant"):
-            module.lora_variant = {}
-        module.lora_variant[adapter_name] = CurvatureLora()
-        CurvatureLora.init(module, adapter_name=adapter_name)
-        count += 1
-    print(f"[CrispEditParam] 已挂载 {count} 个 CurvatureLora 层")
-    return count
-
-
-def update_curvature_bases(
-    peft_model,
-    layer_to_projection_cache: Dict[str, Dict],
-    hparams: CrispEditParamHyperParams,
-    adapter_name: str = "default",
-):
-    """
-    将计算好的投影基（U_in_bar / U_out_bar）写入对应 LoraLayer 的 buffer。
-
-    layer_to_projection_cache:
-        { layer_name_str → { "U_in_bar": Tensor, "U_out_bar": Tensor } }
-
-    layer_name_str 通过 hparams.rewrite_module_tmp.format(layer_num) 生成，
-    例如 "model.layers.{}.mlp.down_proj"。
-    这里用模块全名做前缀匹配，找到对应的 LoraLayer。
-    """
-    updated = 0
-    for layer_name, module in _iter_lora_layers(peft_model, adapter_name):
-        # 找到该模块对应的 projection cache
-        matched_cache = None
-        for cache_key, cache_val in layer_to_projection_cache.items():
-            if cache_key in layer_name or layer_name.endswith(cache_key):
-                matched_cache = cache_val
-                break
-        if matched_cache is None:
-            continue
-
-        dev   = module.lora_A[adapter_name].weight.device
-        dtype = module.lora_A[adapter_name].weight.dtype
-
-        U_in_bar  = matched_cache["U_in_bar"].to(device=dev, dtype=dtype)
-        U_out_bar = matched_cache["U_out_bar"].to(device=dev, dtype=dtype)
-
-        # 直接替换 buffer（register_buffer 时已注册，这里用 setattr 覆盖）
-        setattr(module, f"U_in_bar_{adapter_name}",  U_in_bar)
-        setattr(module, f"U_out_bar_{adapter_name}", U_out_bar)
-        updated += 1
-
-    print(f"[CrispEditParam] 已更新 {updated} 个层的曲率投影基")
-
-
-# ---------------------------------------------------------------------------
-# 从协方差缓存计算投影基
-# ---------------------------------------------------------------------------
 
 def calculate_projection_caches_from_cov_caches(
     model: AutoModelForCausalLM,
     hparams: CrispEditParamHyperParams,
     layer_to_cov_caches: Dict[str, Dict],
     energy_threshold: Optional[float] = None,
-) -> Dict[str, Dict]:
+) -> Dict[torch.nn.Parameter, Dict]:
     """
-    返回 { layer_name → { "U_in_bar": Tensor, "U_out_bar": Tensor } }
+    对每个目标层计算投影缓存，返回 {weight_param → {Ua, Ub, M}}。
+    键为参数对象本身，与 ProjectedAdam 的接口一致。
     """
     energy_threshold = energy_threshold or hparams.energy_threshold
-    layer_to_projection_cache = {}
+    weights = get_weights(model, hparams, bias=False)
+    weight_to_projection_cache = {}
 
     for layer_name, cov_cache in layer_to_cov_caches.items():
         A = cov_cache["A"].to(model.device)
         B = cov_cache["B"].to(model.device)
 
-        # crispedit 原版：非 llama 类模型需要交换 A/B
+        # 非 Llama/phi 类模型需要交换 A/B（与原 crispedit 保持一致）
         if hparams.model_name not in ["Llama3-8B", "phi-1.5"]:
             A, B = B, A
 
         proj_cache = calculate_projection_cache_with_kfac(A, B, energy_threshold)
-        layer_to_projection_cache[layer_name] = proj_cache
 
-    return layer_to_projection_cache
+        # 统一类型（M 保留 float，Ua/Ub 转换为模型 dtype）
+        model_dtype = next(model.parameters()).dtype
+        proj_cache["Ua"] = proj_cache["Ua"].to(model.device, dtype=model_dtype)
+        proj_cache["Ub"] = proj_cache["Ub"].to(model.device, dtype=model_dtype)
+        proj_cache["M"]  = proj_cache["M"] .to(model.device, dtype=model_dtype)
 
+        # 键为权重参数本身
+        weight_param = weights[layer_name]
+        weight_to_projection_cache[weight_param] = proj_cache
 
-# ---------------------------------------------------------------------------
-# 模型包装：用 LoRA + CurvatureLora 替代原始权重直接优化
-# ---------------------------------------------------------------------------
-
-def wrap_model_with_curvature_lora(
-    model: AutoModelForCausalLM,
-    hparams: CrispEditParamHyperParams,
-    adapter_name: str = "default",
-):
-    """
-    1. 用标准 LoRA 包装模型
-    2. 附加 CurvatureLora variant（此时投影基为空，等同普通 LoRA）
-    3. 返回 (peft_model, optimizer)
-
-    调用方随后应调用 apply_cov_caches_to_model() 填入投影基。
-    """
-    peft_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        inference_mode=False,
-        r=hparams.lora_rank,
-        lora_alpha=hparams.lora_alpha,
-        lora_dropout=hparams.lora_dropout,
-        layers_to_transform=hparams.layers if len(hparams.layers) > 0 else None,
-        target_modules=hparams.target_modules,
-    )
-    peft_model = get_peft_model(model, peft_config)
-
-    # 挂载 CurvatureLora，注册空基 buffer
-    attach_curvature_lora(peft_model, adapter_name=adapter_name)
-
-    # 只优化 LoRA 参数（投影基是 buffer，不参与优化）
-    opt = torch.optim.Adam(
-        filter(lambda p: p.requires_grad, peft_model.parameters()),
-        lr=hparams.lr,
-        weight_decay=hparams.weight_decay,
-    )
-    return peft_model, opt
+    return weight_to_projection_cache
 
 
-def apply_cov_caches_to_model(
-    peft_model,
-    layer_to_cov_caches: List[Dict[str, Dict]],
-    model: AutoModelForCausalLM,
-    hparams: CrispEditParamHyperParams,
-    adapter_name: str = "default",
-):
-    """
-    合并多组协方差缓存 → 计算投影基 → 写入 peft_model 各层。
-    在每次新的编辑请求开始时调用（替代 projected_adam 里的 reset_cache）。
-    """
-    if hparams.no_crisp or not layer_to_cov_caches:
-        return
 
-    combined = combine_layer_to_cov_caches(layer_to_cov_caches)
-    layer_to_projection_cache = calculate_projection_caches_from_cov_caches(
-        model, hparams, combined
-    )
-    update_curvature_bases(peft_model, layer_to_projection_cache, hparams, adapter_name)
-
-
-# ---------------------------------------------------------------------------
-# 权重工具（保留与原 crispedit 一致的接口）
-# ---------------------------------------------------------------------------
 
 def get_weights(
     model: AutoModelForCausalLM,
@@ -371,7 +152,7 @@ def get_weights(
     to_cpu: bool = False,
 ) -> Dict[str, torch.Tensor]:
     """提取目标层的权重参数字典（不含 bias），可选择拷贝到 CPU。"""
-    bias = False  # 暂不处理 bias
+    # 将会返回目标层及其对应参数的字典
     return {
         n: (p.detach().cpu().clone() if to_cpu else p)
         for n, p in model.named_parameters()
@@ -435,3 +216,147 @@ def update_model_and_tokenizer_with_appropriate_padding_token(model, tokenizer, 
         model.resize_token_embeddings(len(tokenizer), mean_resizing=False)
         model.config.pad_token_id = tokenizer.pad_token_id
     return model, tokenizer
+
+
+
+def _chunks(lst: List, n: int):
+    for i in range(0, len(lst), n):
+        yield lst[i: i + n]
+
+
+def execute_crispedit_param(
+    model: AutoModelForCausalLM,
+    tok: AutoTokenizer,
+    requests: List[Dict],
+    hparams: "CrispEditParamHyperParams",
+    **kwargs: Any,  # 支持 tracker=... 传入外部日志对象
+) -> AutoModelForCausalLM:
+    """
+    CrispEditParam 主编辑接口：直接对目标层原始权重做曲率投影约束的梯度下降。
+    """
+    print("1、进入执行函数")
+    tracker = kwargs.get("tracker", None)
+    device  = model.device
+
+    if tok.padding_side != "right":
+        tok.padding_side = "right"
+
+    # 增加结束字符，有些方法是在外部添加!
+    # model, tok = update_model_and_tokenizer_with_appropriate_padding_token(model, tok, hparams)
+
+    requests = deepcopy(requests)
+    for i, req in enumerate(requests):
+        if req["target_new"] and req["target_new"][0] != " ":
+            requests[i]["target_new"] = " " + req["target_new"]
+
+    # 1、根据配置文件，冻结其余层参数
+    print("2、冻结非训练层参数")
+    weights = get_weights(model, hparams, bias=False)
+    for name, param in model.named_parameters():
+        param.requires_grad = name in weights
+
+    # 2、根据rome算法中的函数，计算协方差矩阵
+    print("3、计算协方差矩阵")
+    layer_to_cov_cache_old = calculate_cov_cache_with_old_data(model, tok, hparams)
+
+    # 3、对协方差进行特征分解，得到投影基 {param → {Ua, Ub, M}}
+    print("4、求解掩码矩阵")
+    combined_cov_cache = combine_layer_to_cov_caches([layer_to_cov_cache_old])
+    weight_to_projection_cache = calculate_projection_caches_from_cov_caches(
+        model, hparams, combined_cov_cache
+    )
+
+    # 4、创建优化器
+    weights_list = list(weights.values())
+    opt = torch.optim.Adam(
+        weights_list,
+        lr=hparams.lr,
+        weight_decay=hparams.weight_decay,#正则化系数
+    )
+    current_weights_cpu = cache_weights_to_cpu(weights)
+
+    # ── 阶段 4：训练循环 ──────────────────────────────────────────────────
+    texts   = [r["prompt"]     for r in requests]
+    targets = [r["target_new"] for r in requests]
+
+    for step in range(hparams.num_steps):
+        loss_sum, loss_cnt = 0.0, 0
+
+        # 每轮打乱，降低顺序偏差
+        paired = list(zip(texts, targets))
+        random.shuffle(paired)
+        texts_shuffled, targets_shuffled = zip(*paired)
+
+        for txt, tgt in zip(
+            _chunks(list(texts_shuffled),   hparams.batch_size),
+            _chunks(list(targets_shuffled), hparams.batch_size),
+        ):
+            inputs_targets = [t + g for t, g in zip(txt, tgt)]
+            encodings = tok(
+                inputs_targets,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=hparams.max_length,
+            ).to(device)
+
+            # 只对 target 部分计算 loss，prompt 位置置 -100
+            labels = encodings["input_ids"].clone()
+            labels[labels == tok.pad_token_id] = -100
+            for i, prompt in enumerate(txt):
+                prompt_len = len(
+                    tok(prompt, add_special_tokens=True,
+                        truncation=True, max_length=hparams.max_length)["input_ids"]
+                )
+                labels[i, :prompt_len] = -100
+
+            opt.zero_grad(set_to_none=True)
+            loss = model(**encodings, labels=labels).loss
+            loss_sum += loss.item() * labels.size(0)
+            loss_cnt += labels.size(0)
+
+            if loss.item() >= 1e-2:
+                loss.backward()
+
+                # 记录 step 前的权重快照，用于计算实际 ΔW
+                w_before = {p: p.data.clone() for p in weights_list}
+
+                opt.step()
+
+                with torch.no_grad():
+                    for param, proj in weight_to_projection_cache.items():
+                        if param.data.ndim != 2:
+                            continue
+                        U_in  = proj["Ua"].to(device=param.device, dtype=param.dtype)
+                        U_out = proj["Ub"].to(device=param.device, dtype=param.dtype)
+                        M     = proj["M"] .to(device=param.device, dtype=param.dtype)
+
+                        delta_W = param.data - w_before[param]
+
+                        C = U_out.T @ delta_W @ U_in
+                        C = C * M.T
+                        param.data = w_before[param] + U_out @ C @ U_in.T
+
+                '''
+                # 更新之后模型代表的分布发生改变，需要更新K-FAC矩阵进行后续投影
+
+                current_weights_cpu, layer_to_cov_cache_old, recalculated = \
+                    recalculate_cov_cache_if_weights_changed(
+                        model, tok, hparams, current_weights_cpu, layer_to_cov_cache_old
+                    )
+                if recalculated:
+                    new_combined = combine_layer_to_cov_caches([layer_to_cov_cache_old])
+                    weight_to_projection_cache = calculate_projection_caches_from_cov_caches(
+                        model, hparams, new_combined
+                    )
+                '''
+
+        avg_loss = loss_sum / max(loss_cnt, 1)
+        print(f"[CrispEditParam] step {step+1}/{hparams.num_steps}  loss={avg_loss:.4f}")
+        if tracker is not None:
+            tracker.log({"CrispEditParam/loss": avg_loss, "CrispEditParam/step": step + 1})
+        if avg_loss < 1e-2:
+            print("[CrispEditParam] 提前收敛，停止训练")
+            break
+
+    return model
