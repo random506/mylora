@@ -32,3 +32,4 @@ run_7.sh
 run_8.sh
 logs.20260713.bak/
 logs_20260717/
+diagnose_kfac_eig.py

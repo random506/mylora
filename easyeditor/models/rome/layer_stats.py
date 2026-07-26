@@ -1447,7 +1447,7 @@ def load_zsre_ds(json_path):
         "id": [str(i) for i in range(len(records))],
         "url": [""] * len(records),
         "title": [r.get("subject", "") for r in records],
-        "text": [r.get("prompt", "") + " " + r.get("target_new", "") for r in records],
+        "text": [r.get("src", "") + " " + r.get("pred", "") for r in records],
     }
     full_ds = Dataset.from_dict(data_dict)
     split = full_ds.train_test_split(test_size=0.001, seed=69, shuffle=True)
