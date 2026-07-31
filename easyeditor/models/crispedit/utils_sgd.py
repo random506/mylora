@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from peft import AdaLoraConfig, LoraConfig, TaskType, get_peft_model
 from tqdm import trange
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from easyeditor.mymodels.tools import ExperimentTracker
 
 # Standalone SGD variant generated from utils.py_gen_pro.bak.
 from .projected_adam_sgd import ProjectedSGD
@@ -539,11 +540,6 @@ def execute_ft_sgd(
     **kwargs: Any,
 ) -> AutoModelForCausalLM:
     """Run the CrispEdit FT loop with the SGD optimizer defined in this module."""
-    metric_logger = kwargs.get("tracker")
-    if metric_logger is None:
-        from easyeditor.mymodels.tools.tracker import ExperimentTracker
-
-        metric_logger = ExperimentTracker
 
     print("进入执行函数")
     device = model.device
@@ -566,13 +562,12 @@ def execute_ft_sgd(
         model, opt = wrap_model_with_lora_and_return_opt(model, hparams)
         current_weights_cpu = None
     else:
-        print("[1]\n\n\n")
         opt = build_optimizer_with_cov_caches(
             model,
             hparams,
             [layer_to_cov_cache_old],
         )
-        print("[2]\n\n\n")
+
         weights = get_weights(model, hparams, bias=True)
         current_weights_cpu = cache_weights_to_cpu(weights)
         for name, weight in model.named_parameters():
@@ -580,7 +575,6 @@ def execute_ft_sgd(
 
     loss_meter = _AverageMeter()
     pbar = trange(hparams.num_steps)
-    print("[3]\n\n\n")
     for _ in pbar:
         loss_meter.reset()
         random.shuffle(requests)
@@ -644,7 +638,7 @@ def execute_ft_sgd(
                     )
 
         metrics = {"FT Loss": loss_meter.avg}
-        metric_logger.log(metrics)
+        ExperimentTracker.log(metrics)
         pbar.write(f"FT Loss: {loss_meter.avg:.4f}")
         pbar.set_postfix({"loss": f"{loss_meter.avg:.4f}"})
 

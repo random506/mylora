@@ -2,6 +2,7 @@ import random
 import numpy as np
 import os
 from easyeditor.models.crispedit.utils import update_model_and_tokenizer_with_appropriate_padding_token
+from easyeditor.models.crispedit.utils_sgd import execute_ft_sgd
 from crispedit import *
 from easyeditor.mymodels.tools import ExperimentTracker
 from dotenv import load_dotenv
@@ -21,6 +22,10 @@ import torch
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from easyeditor.models.crispedit.CrispEdit_hparams import CrispEditHyperParams
+# 尝试sgd相关的算法
+from easyeditor.models.crispedit.CrispEdit_hparams_sgd import (
+    CrispEditHyperParams as CrispEditSGDHyperParams,
+)
 # 临时使用
 from easyeditor.mymodels.hparams import CrispLoRAHyperParams
 
@@ -50,7 +55,7 @@ def get_arguments():
                                  'safeedit_train', 'safeedit_test'])
     #new
     parser.add_argument('--alg_name', required=True, type=str, default='lora',
-                        choices=['crispedit',"myedit","lora",'mylora','FT','myeditpro'])
+                        choices=['crispedit',"myedit","lora",'mylora','FT','myeditpro','sgd_edit'])# 最后一个算法将优化器改为继承了sgd
     parser.add_argument('--cache_sample_num', type=int, default=10000,
                         help='Number of samples to use for caching projection matrices.')
     parser.add_argument('--edit_sample_num', type=int, default=1000,
@@ -160,6 +165,36 @@ def get_hparams(args):
         hparams.lr = args.lr
 
         return hparams
+    elif args.alg_name == "sgd_edit":
+        if args.sequential_edit:
+            raise ValueError(
+                "--sequential_edit is not supported with --alg_name sgd."
+            )
+        print("[run_sgd] 加载 CrispEdit SGD 配置")
+        hparams = CrispEditSGDHyperParams.from_hparams(
+            f"./hparams/CrispEdit/{args.model}"
+        )
+        hparams.batch_size = args.batch_size
+        hparams.energy_threshold = args.energy_threshold
+        hparams.mom2_n_samples = args.cache_sample_num
+        hparams.edit_n_samples = args.edit_sample_num
+        hparams.recalculate_cache = args.recalculate_cache
+        hparams.recalculate_weight_threshold = args.recalculate_weight_threshold
+        hparams.no_crisp = args.no_crisp
+        hparams.disable_old_loss_check = args.disable_old_loss_check
+        hparams.edit_cache_style = args.edit_cache_style
+        hparams.perform_lora = args.perform_lora
+        hparams.lr = args.lr
+        assert not (not args.no_crisp and args.perform_lora), \
+            "We don't currently support using CrispEdit and LoRA together. " \
+            "Please set --no_crisp if you want to use LoRA."
+        if hparams.perform_lora:
+            hparams.lora_rank = args.lora_rank
+            hparams.lora_alpha = args.lora_alpha
+            hparams.lora_dropout = args.lora_dropout
+            hparams.lora_type = args.lora_type
+            hparams.target_modules = args.target_modules
+        return hparams
     elif args.alg_name == "myeditpro":
         print(f"[run_gen_pro] 加载 Gen Pro 配置")
         hparams = CrispEditHyperParams.from_hparams(
@@ -223,7 +258,7 @@ def calculate_model_name(args, hparams):
         return name.replace('.', '_')
     else:
         name = (f"{args.model}_{args.alg_name}_{args.data_type}"
-                f"_{args.energy_threshold}_{hparams.mom2_n_samples}_{hparams.lr}")#_gen_19-23_1e-5_new")
+                f"_{args.energy_threshold}_{hparams.mom2_n_samples}_{hparams.lr}_sgd_mon_0_9")#_gen_19-23_1e-5_new")
 
     if args.sequential_edit:
         name += f"_sequential_{args.num_edits}"
@@ -270,7 +305,15 @@ if __name__ == "__main__":
     print_time("Begin FT Time")
     print(f"超参数列表为：{hparams}")
 
-    if args.sequential_edit:
+    if args.alg_name == "sgd_edit":
+        print("[1]进行 CrispEdit SGD 方法微调......")
+        edited_model = execute_ft_sgd(
+            model,
+            tokenizer,
+            requests,
+            hparams
+        )
+    elif args.sequential_edit:
         print("[1]Crispedit微调的序列模式")
         edited_model = execute_ft_sequential(model, tokenizer, requests, hparams)
     elif args.projection_method_lora is not None:

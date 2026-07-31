@@ -177,6 +177,7 @@ class ProjectedSGD(SGD):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         self._check_square(edit_factor, "edit_factor")
         self._check_square(cap_factor, "cap_factor")
+
         if edit_factor.shape != cap_factor.shape:
             raise ValueError(
                 "K-FAC factor shape mismatch: "
@@ -186,16 +187,27 @@ class ProjectedSGD(SGD):
         edit_factor = self._symmetrize(edit_factor)
         cap_factor = self._symmetrize(cap_factor)
 
-        edit_eigs, edit_vecs = torch.linalg.eigh(edit_factor)
-        scale = edit_eigs.abs().max().clamp(min=1.0)
-        floor = self.factor_damping * scale
-        edit_eigs = torch.clamp(edit_eigs, min=floor)
+        n = edit_factor.shape[0]
+        trace_scale = edit_factor.diagonal().abs().mean().clamp(min=1e-12)
+        eps = self.factor_damping * trace_scale
+        edit_factor_reg = edit_factor + eps * torch.eye(n, device=edit_factor.device, dtype=edit_factor.dtype)
 
-        inv_sqrt = edit_vecs @ torch.diag(torch.rsqrt(edit_eigs)) @ edit_vecs.T
-        whitened_cap = self._symmetrize(inv_sqrt @ cap_factor @ inv_sqrt)
+        # 3) 条件数统计：阻尼前后对比，诊断 edit_factor 病态程度与阻尼效果。
+        #    若 cond(后) 仍很大，说明 factor_damping 偏小，Cholesky 可能不稳。
+        eigvals = torch.linalg.eigvalsh(edit_factor)
+        cond = eigvals.max() / eigvals.clamp(min=1e-20).min()
+        eigvals_reg = torch.linalg.eigvalsh(edit_factor_reg)
+        cond_reg = eigvals_reg.max() / eigvals_reg.clamp(min=1e-20).min()
+        print(f"条件数(阻尼前): {cond.item():.6f}  条件数(阻尼后): {cond_reg.item():.6f}  "
+              f"eig[min,max]=[{eigvals.clamp(min=1e-20).min().item():.3e}, {eigvals.max().item():.3e}]  "
+              f"eps={eps.item():.3e}")
+
+        L = torch.linalg.cholesky(edit_factor_reg) 
+        tmp = torch.linalg.solve_triangular(L, cap_factor, upper=False)        # 解 L @ tmp = cap_factor
+        whitened_cap = torch.linalg.solve_triangular(L, tmp.T, upper=False).T
         cap_eigs, cap_vecs = torch.linalg.eigh(whitened_cap)
+        q = torch.linalg.solve_triangular(L.transpose(-1, -2), cap_vecs, upper=True)
 
-        q = inv_sqrt @ cap_vecs
         cap_eigs = torch.clamp(cap_eigs, min=0.0)
         return q.contiguous(), cap_eigs.contiguous()
 
@@ -435,6 +447,7 @@ class ProjectedSGD(SGD):
                     )
 
                 if p in additional_cache_map:
+                    print("[additional_cache_map] is not null")
                     source_grad = grad_proj if grad_proj is not None else grad
                     additional_proj = self._soft_kfac_precondition(
                         source_grad,

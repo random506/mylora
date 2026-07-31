@@ -57,7 +57,7 @@ class CrispEditHyperParams(HyperParams):
     newton_damping: float = 1e-3
 
     # SGD controls.
-    sgd_momentum: float = 0.0
+    sgd_momentum: float = 0.9
     sgd_dampening: float = 0.0
     sgd_nesterov: bool = False
     sgd_maximize: bool = False
