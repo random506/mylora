@@ -1,10 +1,6 @@
 import random
 import numpy as np
 import os
-from easyeditor.models.crispedit.utils import update_model_and_tokenizer_with_appropriate_padding_token
-from easyeditor.models.crispedit.utils_sgd import execute_ft_sgd
-from crispedit import *
-from easyeditor.mymodels.tools import ExperimentTracker
 from dotenv import load_dotenv
 load_dotenv()
 from utils import (
@@ -19,22 +15,24 @@ os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
 import argparse
 import torch
-
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from easyeditor.models.crispedit.utils import update_model_and_tokenizer_with_appropriate_padding_token
 from easyeditor.models.crispedit.CrispEdit_hparams import CrispEditHyperParams
-# 尝试sgd相关的算法
+from crispedit import *
+from easyeditor.models.crispedit.utils_sgd import execute_ft_sgd
 from easyeditor.models.crispedit.CrispEdit_hparams_sgd import (
     CrispEditHyperParams as CrispEditSGDHyperParams,
 )
-# 临时使用
-from easyeditor.mymodels.hparams import CrispLoRAHyperParams
 
+from easyeditor.mymodels.tools import ExperimentTracker
+from easyeditor.mymodels.hparams import CrispLoRAHyperParams
 from easyeditor.mymodels.crispedit_param import (
         CrispEditParamHyperParams,
         execute_crispedit_param
     )
 from easyeditor.mymodels import  MyLoRAHyperParams
-# 之后删除除了我的方法其余均调用edit.py
+
 from easyeditor.models.ft import FTHyperParams
 
 SEED = 69
@@ -177,13 +175,6 @@ def get_hparams(args):
         hparams.batch_size = args.batch_size
         hparams.energy_threshold = args.energy_threshold
         hparams.mom2_n_samples = args.cache_sample_num
-        hparams.edit_n_samples = args.edit_sample_num
-        hparams.recalculate_cache = args.recalculate_cache
-        hparams.recalculate_weight_threshold = args.recalculate_weight_threshold
-        hparams.no_crisp = args.no_crisp
-        hparams.disable_old_loss_check = args.disable_old_loss_check
-        hparams.edit_cache_style = args.edit_cache_style
-        hparams.perform_lora = args.perform_lora
         hparams.lr = args.lr
         assert not (not args.no_crisp and args.perform_lora), \
             "We don't currently support using CrispEdit and LoRA together. " \
@@ -258,7 +249,7 @@ def calculate_model_name(args, hparams):
         return name.replace('.', '_')
     else:
         name = (f"{args.model}_{args.alg_name}_{args.data_type}"
-                f"_{args.energy_threshold}_{hparams.mom2_n_samples}_{hparams.lr}_sgd_mon_0_9")#_gen_19-23_1e-5_new")
+                f"_{args.energy_threshold}_{hparams.mom2_n_samples}_{hparams.lr}_sgd")#_gen_19-23_1e-5_new")
 
     if args.sequential_edit:
         name += f"_sequential_{args.num_edits}"

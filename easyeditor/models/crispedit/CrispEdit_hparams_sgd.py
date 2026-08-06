@@ -38,26 +38,13 @@ class CrispEditHyperParams(HyperParams):
     task_mom2_dataset: Optional[str] = None
     task_mom2_n_samples: Optional[int] = None
 
-    # Projection/K-FAC cache paths kept for compatibility with older configs.
-    base_kfac_cache_path: Optional[str] = None
-    task_kfac_cache_path: Optional[str] = None
-    additional_kfac_cache_path: Optional[str] = None
-    second_kfac_cache_path: Optional[str] = None
-    second_projection_kfac_cache_path: Optional[str] = None
-    projection_cache_path: Optional[str] = None
-    base_projection_cache_path: Optional[str] = None
-    primary_projection_cache_path: Optional[str] = None
-    task_projection_cache_path: Optional[str] = None
-    additional_projection_cache_path: Optional[str] = None
-    second_projection_cache_path: Optional[str] = None
-
     # Soft K-FAC controls.
     soft_lambda: float = 1.0
     use_second_projection: bool = False
     newton_damping: float = 1e-3
 
     # SGD controls.
-    sgd_momentum: float = 0.9
+    sgd_momentum: float = 0.0
     sgd_dampening: float = 0.0
     sgd_nesterov: bool = False
     sgd_maximize: bool = False

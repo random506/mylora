@@ -256,17 +256,17 @@ def _sgd_kwargs(hparams) -> Dict:
     return {
         "lr": hparams.lr,
         "momentum": float(
-            getattr(hparams, "sgd_momentum", getattr(hparams, "momentum", 0.0))
+            getattr(hparams, "sgd_momentum", 0.0)
         ),
         "dampening": float(
-            getattr(hparams, "sgd_dampening", getattr(hparams, "dampening", 0.0))
+            getattr(hparams, "sgd_dampening", 0.0)
         ),
         "weight_decay": hparams.weight_decay,
         "nesterov": bool(
-            getattr(hparams, "sgd_nesterov", getattr(hparams, "nesterov", False))
+            getattr(hparams, "sgd_nesterov", False)
         ),
         "maximize": bool(
-            getattr(hparams, "sgd_maximize", getattr(hparams, "maximize", False))
+            getattr(hparams, "sgd_maximize", False)
         ),
     }
 
