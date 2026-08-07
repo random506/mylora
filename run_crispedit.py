@@ -223,10 +223,11 @@ if __name__ == "__main__":
     print(f"Model will be saved to BASE_DIR/{save_model_name}")
 
     ExperimentTracker.init(project=args.wandb_project, name=save_model_name, config=vars(hparams),
-                            tracker_type=args.plat_name,model = args.no_wandb)
+                            tracker_type=args.plat_name,mode = args.no_wandb)
 
     MODEL_NAME = hparams.model_name
-    '''
+    print(f"[0] Load model ......")
+
     if os.path.exists(HF_CACHE_DIR+MODEL_NAME):
         MODEL_NAME=HF_CACHE_DIR+MODEL_NAME
     print(f" Load model path as:{MODEL_NAME}")
@@ -234,7 +235,7 @@ if __name__ == "__main__":
     model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, device_map='auto',  
                                     local_files_only=True)
     '''
-    print(f"[0] Load model ......")
+
     tokenizer = AutoTokenizer.from_pretrained(
         MODEL_NAME,
         cache_dir=HF_CACHE_DIR,
@@ -247,7 +248,7 @@ if __name__ == "__main__":
         device_map="auto",
         local_files_only=True,
     )
-
+    '''
     # set appropriate padding token
     model, tokenizer = update_model_and_tokenizer_with_appropriate_padding_token(model, tokenizer, hparams)
     

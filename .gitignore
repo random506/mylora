@@ -17,6 +17,7 @@ data/
 scripts/
 docs/
 launch_when_ready.sh
+run_0.sh
 run_1.sh
 run_2.sh
 run_3.sh
@@ -26,8 +27,6 @@ Qwen2.5-7B-Instruct/
 .codex/
 Meta-Llama-3-8B-Instruct.sf.bak/
 compare_npz_files.py
-run_7.sh
-run_8.sh
 diagnose_kfac_eig.py
 projected_adam_factor_stats.json
 projected_adam_grad_norm_stats.json

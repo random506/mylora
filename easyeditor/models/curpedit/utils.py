@@ -485,7 +485,7 @@ def chunks(arr, n):
     if len(chunk) > 0:
         yield chunk
 
-class _AverageMeter:
+class AverageMeter:
     def __init__(self):
         self.reset()
 
