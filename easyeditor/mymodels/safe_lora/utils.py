@@ -32,7 +32,7 @@ from ...models.rome.layer_stats import (
     layer_stats_kfac_one_pass,
     layer_stats_kfac_with_txt_tgt,
 )
-from ..tools import *
+from ...tools import *
 
 load_dotenv()
 STATS_DIR = os.getenv("STATS_DIR")

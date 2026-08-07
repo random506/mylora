@@ -4,7 +4,6 @@ __pycache__
 run_me.sh
 .env
 logs/
-logs.bak/
 toy_experiment/data/
 toy_experiment/model_cache/
 toy_experiment/plots/
@@ -15,8 +14,8 @@ run_edited_benchmarks_chunk.py
 Meta-Llama-3-8B-Instruct/
 swanlog/
 data/
-ARGS.md
 scripts/
+docs/
 launch_when_ready.sh
 run_1.sh
 run_2.sh
@@ -24,14 +23,11 @@ run_3.sh
 run_4.sh
 .claude/
 Qwen2.5-7B-Instruct/
-AGENTS.md
 .codex/
 Meta-Llama-3-8B-Instruct.sf.bak/
 compare_npz_files.py
 run_7.sh
 run_8.sh
-logs.20260713.bak/
-logs_20260717/
 diagnose_kfac_eig.py
 projected_adam_factor_stats.json
 projected_adam_grad_norm_stats.json

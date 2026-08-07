@@ -14,7 +14,7 @@ print("HF_DATASETS_DIR =", os.getenv("HF_DATASETS_DIR"))
 
 import numpy as np
 import torch
-from easyeditor.mymodels.tools.tracker import ExperimentTracker
+from easyeditor.tools.tracker import ExperimentTracker
 from lm_eval import simple_evaluate
 
 HF_DATASETS_DIR = os.getenv("HF_DATASETS_DIR")

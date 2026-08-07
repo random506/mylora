@@ -3,7 +3,7 @@ import torch
 from typing import List
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from ..hparams import CrispLoRAHyperParams
-from ..tools import *
+from ...tools import *
 
 def _compute_loss(
     model,

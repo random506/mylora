@@ -17,7 +17,7 @@ from easyeditor.evaluate.evaluate_utils_vllm import resolve_pending_llm_judges
 import random
 import torch
 from tqdm import tqdm
-from easyeditor.mymodels.tools import ExperimentTracker
+from easyeditor.tools import ExperimentTracker
 from easyeditor.util import HyperParams
 
 

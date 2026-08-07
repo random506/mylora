@@ -1,41 +1,56 @@
 ---
 name: analyze-results
-description: Use when completed experiment artifacts, benchmark outputs, run metrics, or docs/experiments/*.md need to be inspected, summarized, compared, or written back into an experiment document. Trigger for requests about best runs, collect_runs.py, model_utility, TOFU metrics, RESULTS_ANALYSIS.md, missing artifacts, or updating Results, Analysis, or status sections.
+description: Aggregate and compare this mylora project's completed or partial experiment results from logs/, including capability.json and LLM-judge mean_metrics.json artifacts. Use when Codex needs to organize experiments, compare capability and editing accuracy, identify missing result artifacts, filter run names, or generate docs/experiments/*_results_analysis.md.
 ---
 
 # Analyze Experiment Results
 
 ## Workflow
 
-1. Identify the experiment from the user prompt, experiment docs, script names, or task-name patterns.
-2. Read the target experiment doc first; it owns planned runs, selection rules, script paths, and output paths.
-3. Read `docs/experiments/AGENTS.md` before editing experiment docs.
-4. Read `RESULTS_ANALYSIS.md` or `TOFU_METRICS.md` only when metric interpretation is needed.
-5. Use the narrowest useful run set. Prefer exact task names; otherwise filter by benchmark, model, split, trainer, PEFT, LR, or glob.
-6. Batch-load summary metrics with the collector instead of opening many run files manually.
-7. Inspect configs, logs, or raw eval JSON only for missing artifacts, anomalous metrics, or tie-breaking.
-8. Before writing, state the selection rule used for best-run decisions.
-9. Update mainly `## Results`, `## Analysis`, and status. Preserve the document narrative and unrelated sections.
-10. Mark status as Done only when all planned runs have local artifacts and the analysis is written.
-
-## Collector Usage
-
-Prefer the experiment document and referenced script over generic conventions. If `collect_runs.py` is not at the repository root, locate it with `rg --files | rg collect_runs.py` or the platform equivalent.
+1. Locate the repository root and use `logs/` as the default results root.
+2. Treat a base experiment directory and its two evaluation directories as one experiment:
+   - `<run>/capability.json`
+   - `<run>_eval_llm_judge_no_context/mean_metrics.json`
+   - `<run>_eval_llm_judge_qa_inst/mean_metrics.json`
+3. Run the bundled collector from the repository root:
 
 ```bash
-python collect_runs.py \
-  --doc docs/experiments/YY-MM-DD-example.md \
-  --script scripts/experiments/YY-MM-DD-example.sh \
-  --run-pattern 'tofu_Llama-3.1-8B-Instruct_forget10_*' \
-  --group-by trainer,peft \
-  --best-by model_utility
+python skills/analyze-results/collect_runs.py
 ```
+
+4. Use `--run <base-run-name>` for exact selections or `--run-pattern '<glob>'` for pattern selections. Repeat either option to select multiple experiments.
+5. Read the generated report path printed by the collector and inspect the single comparison table plus any missing-artifact section.
+6. Tell the user where the report was written and summarize objective comparisons. Do not declare one overall best experiment because the report intentionally keeps capability, no-context editing, and QA-instruction editing separate.
+
+## Metric Contract
+
+Read only the two canonical artifact types above. Ignore `results.json`, `results_pending_judge.json`, and other raw files.
+
+Extract these capability metrics:
+
+- IFEval: `results.ifeval["prompt_level_strict_acc,none"]`
+- TruthfulQA MC2: `results.truthfulqa_mc2["acc,none"]`
+- MMLU: `results.mmlu["acc,none"]`
+- GSM8K CoT: `results.gsm8k_cot["exact_match,flexible-extract"]`
+- ARC Challenge: `results.arc_challenge["acc_norm,none"]`
+
+Calculate `Capability Mean` only when all five values exist. For each evaluation context, extract only `post.rewrite_acc` and `post.rephrase_acc`, then calculate that context's mean only when both values exist. Never calculate a partial mean.
+
+## Report Contract
+
+- Write a new report to `docs/experiments/YYYYMMDD_HHMMSS_results_analysis.md` using Asia/Shanghai time.
+- Refuse to overwrite an existing report.
+- Render one wide Markdown table with one row per base experiment.
+- Show scores as percentages with two decimal places.
+- Sort rows by the complete base run name.
+- Bold every tied maximum in `Capability Mean`, `No Context Mean`, and `QA Inst Mean`.
+- Include incomplete and evaluation-only experiments with `N/A` values and list their missing or invalid canonical artifacts.
+- Do not parse model names, methods, hyperparameters, learning rates, or optimizers from directory names.
+- Do not calculate a combined score across capability and editing contexts.
 
 ## Rules
 
-- Never fabricate, estimate, or silently average missing data.
-- Do not name a best run until the selection rule is explicit.
-- Prefer exact local artifacts over assumptions from task names.
-- Preserve existing status style, checkbox style, and section tone.
-- Add concise evidence and interpretation instead of rewriting wholesale.
-- If artifacts are missing, report what is missing and leave status incomplete.
+- Never fabricate, estimate, or infer a missing metric from a raw result file.
+- Treat `capability.json` and `mean_metrics.json` as the only authoritative inputs.
+- Preserve raw floating-point precision during calculation; round only for Markdown display.
+- Prefer the default full comparison unless the user names a specific experiment scope.

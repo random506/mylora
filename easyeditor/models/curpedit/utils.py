@@ -1,25 +1,24 @@
-import random
 import gc
 import os
 from copy import deepcopy
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
+import random
 from dotenv import load_dotenv
-from peft import AdaLoraConfig, LoraConfig, TaskType, get_peft_model
 from tqdm import trange
+from peft import AdaLoraConfig, LoraConfig, TaskType, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from easyeditor.mymodels.tools import ExperimentTracker
 
-# Standalone SGD variant generated from utils.py_gen_pro.bak.
-from .projected_adam_sgd import ProjectedSGD
+from .projected_adam import  ProjectedAdam
 from ..rome.layer_stats import (
     calculate_cache_loss,
     calculate_request_loss,
     layer_stats_kfac_one_pass,
     layer_stats_kfac_with_txt_tgt,
 )
-from .CrispEdit_hparams_sgd import CrispEditHyperParams
+from .CrispEdit_hparams import AdamHyperParams
+from easyeditor.tools import ExperimentTracker
 
 load_dotenv()
 STATS_DIR = os.getenv("STATS_DIR")
@@ -57,7 +56,7 @@ def _build_cov_cache_from_hparams(
     sample_size = _cache_sample_size(hparams)
 
     task_mom2_dataset = getattr(hparams, "task_mom2_dataset", None)
-    task_sample_size = int(getattr(hparams, "task_mom2_n_samples", None) or sample_size)
+    task_sample_size= getattr(hparams, "task_mom2_n_samples", None)
     print("[CrispEdit] Computing/loading base KFAC stats.")
     stats_dict = layer_stats_kfac_one_pass(
         model=model,
@@ -120,7 +119,7 @@ def calculate_projection_cache_with_kfac(A, B, energy_threshold=0.9):
 
 def get_weights(
     model: AutoModelForCausalLM,
-    hparams: CrispEditHyperParams,
+    hparams: AdamHyperParams,
     bias: bool,
     to_cpu: bool = False,
 ) -> Dict[str, torch.Tensor]:
@@ -252,29 +251,6 @@ def _valid_cov_caches(layer_to_cov_caches: Optional[List[Dict[str, Dict]]]) -> L
     return [cache for cache in layer_to_cov_caches if cache]
 
 
-def _sgd_kwargs(hparams) -> Dict:
-    return {
-        "lr": hparams.lr,
-        "momentum": float(
-            getattr(hparams, "sgd_momentum", 0.0)
-        ),
-        "dampening": float(
-            getattr(hparams, "sgd_dampening", 0.0)
-        ),
-        "weight_decay": hparams.weight_decay,
-        "nesterov": bool(
-            getattr(hparams, "sgd_nesterov", False)
-        ),
-        "maximize": bool(
-            getattr(hparams, "sgd_maximize", False)
-        ),
-    }
-
-
-def _build_plain_sgd(params, hparams):
-    return torch.optim.SGD(params, **_sgd_kwargs(hparams))
-
-
 def build_optimizer_with_cov_caches(
     model,
     hparams,
@@ -285,49 +261,42 @@ def build_optimizer_with_cov_caches(
         return opt
 
     weights = get_weights(model, hparams, bias=True)
-    weight_params = list(weights.values())
+    weight_params = [v for _, v in weights.items()]
 
     if getattr(hparams, "no_crisp", False):
-        return _build_plain_sgd(weight_params, hparams)
+        return torch.optim.Adam(
+            weight_params,
+            lr=hparams.lr,
+            weight_decay=hparams.weight_decay,
+        )
 
     valid_caches = _valid_cov_caches(layer_to_cov_caches)
-    primary_cov_cache = (
-        combine_layer_to_cov_caches([valid_caches[0]]) if valid_caches else {}
-    )
-    primary_projection_cache = (
-        calculate_projection_caches_from_cov_caches(
-            model,
-            hparams,
-            primary_cov_cache,
+
+    primary_cov_cache = combine_layer_to_cov_caches([valid_caches[0]])
+
+
+
+    primary_projection_cache = calculate_projection_caches_from_cov_caches(
+        model,
+        hparams,
+        primary_cov_cache
         )
-        if primary_cov_cache
-        else {}
-    )
-    soft_lambda = getattr(
-        hparams,
-        "soft_lambda",
-        getattr(hparams, "newton_lambda", getattr(hparams, "lambda_soft", 1.0)),
-    )
-    factor_damping = getattr(
-        hparams,
-        "factor_damping",
-        getattr(hparams, "newton_damping", 1e-3),
-    )
 
-    if isinstance(opt, ProjectedSGD):
-        for group in opt.param_groups:
-            group.update(_sgd_kwargs(hparams))
-            group["soft_lambda"] = float(soft_lambda)
-        opt.factor_damping = max(float(factor_damping), 0.0)
-        opt.reset_cache(primary_projection_cache)
-        return opt
-
-    return ProjectedSGD(
+    return ProjectedAdam(
         weight_params,
         projection_cache_map=primary_projection_cache,
-        soft_lambda=soft_lambda,
-        factor_damping=factor_damping,
-        **_sgd_kwargs(hparams),
+        soft_lambda=getattr(
+            hparams,
+            "soft_lambda",
+            getattr(hparams, "newton_lambda", getattr(hparams, "lambda_soft", 1.0)),
+        ),
+        factor_damping=getattr(
+            hparams,
+            "factor_damping",
+            getattr(hparams, "newton_damping", 1e-3),
+        ),
+        lr=hparams.lr,
+        weight_decay=hparams.weight_decay,
     )
 
 
@@ -389,7 +358,8 @@ def combine_layer_to_cov_caches(
                     "task_num_samples": task_total_samples,
                 }
             )
-    print(f"[CrispEdit-SGD] Combined {len(layer_to_cov_caches)} covariance caches.")
+    print(f"Combined samples {num_samples_list}")
+    print(f"\n\n\nlook:{combined_layer_to_cov_caches}\n\n\n")
     return combined_layer_to_cov_caches
 
 
@@ -464,10 +434,7 @@ def calculate_projection_caches_from_cov_caches(
         del A, B, task_A, task_B
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-    print(
-        f"[CrispEdit-SGD] Built soft K-FAC caches for "
-        f"{len(weight_to_projection_cache)} weights."
-    )
+    print(f"\n\n\nlook:{weight_to_projection_cache}\n\n\n")
     return weight_to_projection_cache
 
 
@@ -489,7 +456,11 @@ def wrap_model_with_lora_and_return_opt(model, hparams):
         target_modules=hparams.target_modules,
     )
     peft_model = get_peft_model(model, peft_config)
-    opt = _build_plain_sgd(peft_model.parameters(), hparams)
+    opt = torch.optim.Adam(
+        peft_model.parameters(),
+        lr=hparams.lr,
+        weight_decay=hparams.weight_decay,
+    )
     return peft_model, opt
 
 
@@ -503,17 +474,16 @@ def update_model_and_tokenizer_with_appropriate_padding_token(model, tokenizer, 
         model.config.pad_token_id = tokenizer.pad_token_id
     return model, tokenizer
 
-
-def _chunks(items, chunk_size):
+def chunks(arr, n):
+    """Yield successive n-sized chunks from arr."""
     chunk = []
-    for item in items:
-        chunk.append(item)
-        if len(chunk) == chunk_size:
+    for a in arr:
+        chunk.append(a)
+        if len(chunk) == n:
             yield chunk
             chunk = []
-    if chunk:
+    if len(chunk) > 0:
         yield chunk
-
 
 class _AverageMeter:
     def __init__(self):
@@ -530,99 +500,77 @@ class _AverageMeter:
         self.sum += val * n
         self.count += n
         self.avg = self.sum / self.count
-
-
-def execute_ft_sgd(
+        
+def execute_sft_adam(
     model: AutoModelForCausalLM,
     tok: AutoTokenizer,
     requests: List[Dict],
-    hparams: CrispEditHyperParams,
+    hparams: AdamHyperParams,
     **kwargs: Any,
 ) -> AutoModelForCausalLM:
-    """Run the CrispEdit FT loop with the SGD optimizer defined in this module."""
-
+    """
+    Executes the FT update algorithm for the specified update at the specified layer
+    """
     print("进入执行函数")
     device = model.device
     if tok.padding_side != "right":
         tok.padding_side = "right"
-
+    
     requests = deepcopy(requests)
-    for index, request in enumerate(requests):
+    for i, request in enumerate(requests):
         if request["target_new"] and request["target_new"][0] != " ":
-            requests[index]["target_new"] = " " + request["target_new"]
-
+            requests[i]["target_new"] = " " + request["target_new"]
+    
     layer_to_cov_cache_old = calculate_cov_cache_with_old_data(
-        model,
-        tok,
-        hparams,
-        force_recompute=False,
+        model, tok, hparams, force_recompute=False
     )
-
+    
     if hparams.perform_lora:
         model, opt = wrap_model_with_lora_and_return_opt(model, hparams)
-        current_weights_cpu = None
+        current_weights_cpu = None #my code gets uglier with each day
     else:
-        opt = build_optimizer_with_cov_caches(
-            model,
-            hparams,
-            [layer_to_cov_cache_old],
-        )
-
+        print("[1]\n\n\n")
+        opt = build_optimizer_with_cov_caches(model, hparams, [layer_to_cov_cache_old])
+        print("[2]\n\n\n")
         weights = get_weights(model, hparams, bias=True)
         current_weights_cpu = cache_weights_to_cpu(weights)
-        for name, weight in model.named_parameters():
-            weight.requires_grad = name in weights
-
-    loss_meter = _AverageMeter()
+        for name, w in model.named_parameters():
+            w.requires_grad = name in weights
+    
+    #old_loss = calculate_old_loss(model, tok, hparams)
+    #ExperimentTracker.log(old_loss) # fine to log even if empty, basically no-op
+    
+    loss_meter = AverageMeter()
     pbar = trange(hparams.num_steps)
-    for _ in pbar:
+    print("[3]\n\n\n")
+    for it in pbar:
         loss_meter.reset()
+
         random.shuffle(requests)
-        texts = [request["prompt"] for request in requests]
-        targets = [request["target_new"] for request in requests]
+        texts = [r["prompt"] for r in requests]
+        targets = [r["target_new"] for r in requests]
 
-        for text_batch, target_batch in zip(
-            _chunks(texts, hparams.batch_size),
-            _chunks(targets, hparams.batch_size),
+        # split into batches
+        for txt, tgt in zip(
+            chunks(texts, hparams.batch_size), chunks(targets, hparams.batch_size)
         ):
-            inputs_targets = [
-                text + target
-                for text, target in zip(text_batch, target_batch)
-            ]
-            encodings = tok(
-                inputs_targets,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=hparams.max_length,
-            ).to(device)
+            inputs_targets = [txt_ + tgt_ for txt_, tgt_ in zip(txt, tgt)]
+            encodings = tok(inputs_targets, return_tensors="pt", padding=True, truncation=True, max_length=hparams.max_length).to(device)
             labels = encodings["input_ids"].clone()
+
             labels[labels == tok.pad_token_id] = -100
-
-            for index, prompt in enumerate(text_batch):
-                prompt_len = len(
-                    tok(
-                        prompt,
-                        add_special_tokens=True,
-                        truncation=True,
-                        max_length=hparams.max_length,
-                    )["input_ids"]
-                )
-                labels[index, :prompt_len] = -100
-
+            for i, prompt in enumerate(txt):
+                prompt_len = len(tok(prompt, add_special_tokens=True, truncation=True, max_length=hparams.max_length)["input_ids"])
+                labels[i, :prompt_len] = -100
             opt.zero_grad(set_to_none=True)
             outputs = model(**encodings, labels=labels)
             loss = outputs.loss
+                
             loss_meter.update(loss.item(), n=labels.size(0))
-
             if loss.item() >= 1e-2:
                 loss.backward()
                 opt.step()
-                (
-                    current_weights_cpu,
-                    layer_to_cov_cache_old,
-                    should_recalculate,
-                ) = recalculate_cov_cache_if_weights_changed(
+                current_weights_cpu, layer_to_cov_cache_old, should_recalculate = recalculate_cov_cache_if_weights_changed(
                     model,
                     tok,
                     hparams,
@@ -630,22 +578,21 @@ def execute_ft_sgd(
                     layer_to_cov_cache_old,
                 )
                 if should_recalculate:
-                    opt = build_optimizer_with_cov_caches(
-                        model,
-                        hparams,
-                        [layer_to_cov_cache_old],
-                        opt=opt,
-                    )
+                    opt = build_optimizer_with_cov_caches(model, hparams, [layer_to_cov_cache_old], opt=opt)
+        #metrics = calculate_old_loss(model, tok, hparams)
+        #metrics.update({f"FT Loss": loss_meter.avg})
+        #ExperimentTracker.log(metrics) # fine to log even if empty, basically no-op
 
         metrics = {"FT Loss": loss_meter.avg}
-        ExperimentTracker.log(metrics)
+        ExperimentTracker.log(metrics) # fine to log even if empty, basically no-op
         pbar.write(f"FT Loss: {loss_meter.avg:.4f}")
+        
         pbar.set_postfix({"loss": f"{loss_meter.avg:.4f}"})
 
         if loss_meter.avg < 1e-2:
             break
-
+    
     if hparams.perform_lora:
         model = model.merge_and_unload()
-
+    
     return model

@@ -28,10 +28,15 @@ mom2_dataset: "wikipedia"
 mom2_n_samples: 10000
 mom2_dtype: "float32"
 energy_threshold: 0.8
+task_mom2_dataset: "wiki_big_edit_3k"
+task_mom2_n_samples: 3000
 
-base_kfac_cache_path: "/home/zwz/01_crispedit/Meta-Llama-3-8B-Instruct/wikipedia_stats"
-task_kfac_cache_path: "/home/zwz/01_crispedit/Meta-Llama-3-8B-Instruct/zsre_mend_163k_stats"
-projection_cache_path: null
-task_projection_cache_path: null
-newton_damping:  1e-3
-use_second_projection: True
+#base_kfac_cache_path: "/home/zwz/01_crispedit/Meta-Llama-3-8B-Instruct/wikipedia_stats"
+#task_kfac_cache_path: "/home/zwz/01_crispedit/Meta-Llama-3-8B-Instruct/zsre_mend_163k_stats"
+#projection_cache_path: null
+#task_projection_cache_path: null
+newton_damping:  1e-5
+soft_lambda: 1
+#soft_lambda = 1    -> 缩放 = 1 / 2 = 0.5
+#soft_lambda = 9    -> 缩放 = 1 / 10 = 0.1
+#soft_lambda = 99   -> 缩放 = 1 / 100 = 0.01

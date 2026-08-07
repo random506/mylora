@@ -4,7 +4,7 @@ from typing import Any, Dict, List
 import torch
 from tqdm import trange
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from easyeditor.mymodels.tools.tracker import ExperimentTracker
+from easyeditor.tools.tracker import ExperimentTracker
 from utils import chunks, save_model_and_tokenizer
 
 from easyeditor.models.crispedit.CrispEdit_hparams import CrispEditHyperParams
