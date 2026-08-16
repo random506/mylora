@@ -1,0 +1,4 @@
+interface:
+  display_name: "Plan Next Experiment"
+  short_description: "Plan mylora experiments and runnable GPU scripts"
+  default_prompt: "Use $plan-next-experiment to design the next controlled experiment and create its linked Chinese plan and standalone GPU script."
