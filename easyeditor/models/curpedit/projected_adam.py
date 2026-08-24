@@ -588,28 +588,6 @@ class ProjectedAdam(Adam):
         with self.grad_norm_stats_json_path.open("w", encoding="utf-8") as handle:
             json.dump(self._grad_norm_records, handle, indent=2, sort_keys=True)
 
-    def _limit_relative_change(
-        self,
-        source: torch.Tensor,
-        filtered: torch.Tensor,
-    ) -> torch.Tensor:
-        if self.max_relative_change is None:
-            return filtered
-        if not torch.isfinite(filtered).all():
-            raise RuntimeError("spectral filtering produced non-finite values")
-
-        delta = filtered - source
-        delta_norm = delta.norm()
-        if delta_norm == 0:
-            return filtered
-
-        source_norm = source.norm()
-        if source_norm == 0:
-            return source
-
-        max_delta_norm = self.max_relative_change * source_norm
-        scale = torch.clamp(max_delta_norm / delta_norm, max=1.0)
-        return source + scale * delta
 
     def _record_grad_norm(
         self,
@@ -711,9 +689,12 @@ class ProjectedAdam(Adam):
         # 软收缩分母：高能力方向 (b_i*a_j 大) 收缩更强。
         denom = 1.0 + float(soft_lambda) * joint_eigs
         # 预条件：谱空间逐元素除，再变回原空间。
-        filtered = q_b @ (coeffs / denom.clamp(min=1e-12)) @ q_a.T
-        # 对比！！！！！！！
-        #preconditioned = self._limit_relative_change(source, filtered)
+        edit_A = self._tensor(cache, "edit_A", source, compute_dtype)
+        edit_B = self._tensor(cache, "edit_B", source, compute_dtype)
+        edit_A =  q_a.T @ edit_A
+        edit_B = edit_B@q_b
+        filtered = edit_B @ (coeffs / denom.clamp(min=1e-12)) @ edit_A
+        filtered 
         return filtered.to(dtype=tensor.dtype)
 
     # ======================================================================

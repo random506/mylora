@@ -1,0 +1,22 @@
+[
+  {
+    "layer_index": 19,
+    "output_dir": "logs/experiment1/layer_19"
+  },
+  {
+    "layer_index": 20,
+    "output_dir": "logs/experiment1/layer_20"
+  },
+  {
+    "layer_index": 21,
+    "output_dir": "logs/experiment1/layer_21"
+  },
+  {
+    "layer_index": 22,
+    "output_dir": "logs/experiment1/layer_22"
+  },
+  {
+    "layer_index": 23,
+    "output_dir": "logs/experiment1/layer_23"
+  }
+]

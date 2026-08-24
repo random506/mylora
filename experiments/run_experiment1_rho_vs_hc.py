@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+# ruff: noqa: E402
 """
 实验一：核心假设验证 —— ρ(v) 是否优于 H_c？
 
@@ -19,6 +20,9 @@
   - 独立可运行脚本，复用现有原语，不改动编辑器主流程；
   - ΔC = 能力 KL 散度 D_cap(θ',θ_0) = (1/N) Σ KL(p_θ0(·|x) ‖ p_θ(·|x))；
   - ΔE = L_edit(θ_0) − L_edit(θ_0 + α V_k)；
+  - 所有候选方向按编辑梯度统一到下降半空间；
+  - 多个固定小步长仅用于 edit-only line search，每个方向只保留 ΔE 最大的一条主记录；
+  - ΔE 未超过阈值的方向标记无效，R=null，不使用人为分母 floor；
   - save-modify-restore：用 .copy_() 原地改单层权重，try/finally 必恢复（保 device_map 分片）。
 
 K-FAC 曲率用迹公式（避免构造 58M×58M 完整 H）：
@@ -26,10 +30,17 @@ K-FAC 曲率用迹公式（避免构造 58M×58M 完整 H）：
     e = trace(edit_B @ V @ edit_A @ V.T)
     ρ = c / (e + ε)
 
+主流程：模型/缓存 -> 候选方向 -> 曲率预测 -> 固定步长编辑探针 ->
+选择最大编辑收益的方向记录 -> 有效方向相关性与 bootstrap 汇总。
+
 运行（从仓库根目录）：
     CUDA_VISIBLE_DEVICES=0 python experiments/run_experiment1_rho_vs_hc.py \\
         --model llama3-8b --layer 19 --K 60 --N_alpha 4 --N_cap 64 --N_edit 20 \\
         --out_dir logs/experiment1/
+
+Multi-layer run (one independent result directory per layer):
+    python experiments/run_experiment1_rho_vs_hc.py \\
+        --model llama3-8b --layers 19 20 21 --out_dir logs/experiment1/
 
 冒烟测试：
     python experiments/run_experiment1_rho_vs_hc.py --K 8 --N_alpha 2 --N_cap 16 --N_edit 4
@@ -38,9 +49,14 @@ K-FAC 曲率用迹公式（避免构造 58M×58M 完整 H）：
 import argparse
 import json
 import os
+import sys
 import random
-from copy import deepcopy
 from typing import Dict, List, Optional, Tuple
+
+# 以 `python experiments/run_experiment1_rho_vs_hc.py` 运行时，sys.path[0] 是
+# experiments/ 而非仓库根目录，导致 easyeditor、utils 等根级模块不可导入；
+# 这里把仓库根目录加入搜索路径。
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 import torch
@@ -64,9 +80,6 @@ from easyeditor.models.curpedit.utils import (
     _is_llama_or_phi,
 )
 from easyeditor.models.rome.layer_stats import (
-    calculate_request_loss,
-    get_max_length_from_model,
-    get_num_positions_from_model,
     load_stats_ds,
 )
 from easyeditor.models.rome.tok_dataset import (
@@ -84,10 +97,15 @@ import utils as root_utils  # prepare_requests_from_data_type
 SEED = 69
 ALPHAS_REL_DEFAULT: Tuple[float, ...] = (1e-4, 5e-4, 1e-3, 5e-3)
 EPS_RHO = 1e-12
-DELTA_E_FLOOR = 1e-4
 KL_PER_TOKEN_CLAMP = 100.0  # 单 token KL 上限（nats），防极端离群点
 RESTORE_ATOL = 1e-7
 SOURCE_NAMES = ("top_cap", "generalized", "random", "edit_gradient")
+
+# 因子矩阵与线性代数（eigh / Cholesky / 矩阵乘）的计算设备。
+# 优先 CUDA 加速；CUDA 不可用时回退 CPU（设 CUDA_VISIBLE_DEVICES="" 可强制 CPU）。
+# 注意：cap_A/edit_A 可达 [14336,14336]≈3.3GB(fp32)，eigh 需额外同等量级工作区，
+# 显存吃紧时可改回 CPU 或减小规模。
+COMPUTE_DEVICE: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 # --------------------------------------------------------------------------- #
@@ -114,6 +132,7 @@ def _check_square(matrix: torch.Tensor, name: str) -> None:
 # 1. 模型 / hparams 加载（复制 run_crispedit.py:228-236 + :30-35 模式）
 # --------------------------------------------------------------------------- #
 def load_model_and_hparams(model_key: str):
+    """Load the frozen base model and the CurpEdit configuration used by the probe."""
     """返回 (model, tok, hparams)。"""
     hparams = AdamHyperParams.from_hparams(f"./hparams/CurpEdit/{model_key}")
 
@@ -139,8 +158,17 @@ def load_model_and_hparams(model_key: str):
 # --------------------------------------------------------------------------- #
 # 2. 因子构建（绕过 weight-keyed projection_cache 间接层，直接取单层 cov_cache）
 # --------------------------------------------------------------------------- #
-def build_factors(model, tok, hparams, layer_idx: int) -> Dict:
+def build_factors(
+    model,
+    tok,
+    hparams,
+    layer_idx: int,
+    layer_to_cov: Optional[Dict] = None,
+) -> Dict:
     """
+    # A multi-layer run builds one shared cov-cache, then selects one layer's
+    # four factors here. Keeping this lookup separate lets every layer reuse
+    # the expensive K-FAC statistics without coupling their measurements.
     调 _build_cov_cache_from_hparams 计算全部目标层 K-FAC 协方差，再取出指定层。
     原始 cov_cache 键为 "A"/"B"/"task_A"/"task_B"（非 cap_A/edit_A）；
     这里按 Llama no-swap 约定映射：
@@ -149,10 +177,13 @@ def build_factors(model, tok, hparams, layer_idx: int) -> Dict:
         edit_A = cache["task_A"] ([in, in])
         edit_B = cache["task_B"] ([out, out])
     """
-    layer_to_cov = _build_cov_cache_from_hparams(model, tok, hparams, force_recompute=False)
+    if layer_to_cov is None:
+        layer_to_cov = _build_cov_cache_from_hparams(
+            model, tok, hparams, force_recompute=False
+        )
 
-    # 单层实验：直接用 rewrite_module_tmp 格式化目标层名。
-    # main 中已把 hparams.layers 收窄为 [layer_idx]，故 cov_cache 只算/读该层。
+    # Resolve the requested layer from either a per-layer cache or a shared
+    # cache containing every layer requested by --layers.
     layer_name = hparams.rewrite_module_tmp.format(layer_idx)
     if layer_name not in layer_to_cov:
         # 兜底：按层索引扫描（兼容命名差异）
@@ -194,10 +225,10 @@ def build_factors(model, tok, hparams, layer_idx: int) -> Dict:
 
     factors = {
         "layer_name": layer_name,
-        "cap_A": A_in.to("cpu", dtype=torch.float32).contiguous(),
-        "cap_B": B_out.to("cpu", dtype=torch.float32).contiguous(),
-        "edit_A": tA_in.to("cpu", dtype=torch.float32).contiguous(),
-        "edit_B": tB_out.to("cpu", dtype=torch.float32).contiguous(),
+        "cap_A": A_in.to(COMPUTE_DEVICE, dtype=torch.float32).contiguous(),
+        "cap_B": B_out.to(COMPUTE_DEVICE, dtype=torch.float32).contiguous(),
+        "edit_A": tA_in.to(COMPUTE_DEVICE, dtype=torch.float32).contiguous(),
+        "edit_B": tB_out.to(COMPUTE_DEVICE, dtype=torch.float32).contiguous(),
         "weight_param": weight_param,
         "theta0": weight_param.data.detach().clone(),
         "out_dim": out_dim,
@@ -221,6 +252,9 @@ def generalized_basis(
     verbose: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
+    # Whitening by H_e turns the generalized problem H_c q = rho H_e q into
+    # an ordinary symmetric eigendecomposition. The returned q/dual_q pair
+    # is also used by the generalized direction builder below.
     复制自 projected_adam.py:301-360 的 Cholesky 白化核心（不实例化 ProjectedAdam）。
     返回 (q, dual_q, cap_eigs)：
         Q^T edit_factor Q = I,   Q^T cap_factor Q = diag(cap_eigs)。
@@ -264,15 +298,23 @@ def generalized_basis(
 
 def kfac_quad_form(V: torch.Tensor, A: torch.Tensor, B: torch.Tensor) -> float:
     """
+    # The full Hessian would be (out*in)^2 entries. The Kronecker trace form
+    # computes the same quadratic form without materializing that matrix.
     Kronecker 二次型迹公式：c(V) = trace(B @ V @ A @ V.T)。
     V:[out,in], A:[in,in], B:[out,out]。返回 Python float。
+    V 常驻 CPU 以省显存（K 条方向累积可达数十 GB），A/B 在 COMPUTE_DEVICE；
+    这里把 V 临时搬到 A 的设备上做乘法，取回 Python float 后即释放。
     """
+    V = V.to(device=A.device, dtype=A.dtype)
     # 用两步乘法控制显存：M = V @ A  ([out,in])，tmp = B @ V ([out,in])
     VA = V @ A                       # [out, in]
     return float(torch.trace(B @ (VA @ V.T)).clamp(min=0.0).item())
 
 
 def normalize_frobenius(V: torch.Tensor) -> torch.Tensor:
+    # V 常驻 CPU：K 条方向累积可达数十 GB，放 GPU 会 OOM；
+    # kfac_quad_form 会按需把 V 临时搬到因子所在设备做乘法。
+    V = V.to("cpu", dtype=torch.float32)
     norm = V.norm().item()
     if norm < 1e-30:
         raise RuntimeError("direction V has near-zero Frobenius norm; cannot normalize")
@@ -280,17 +322,18 @@ def normalize_frobenius(V: torch.Tensor) -> torch.Tensor:
 
 
 # --------------------------------------------------------------------------- #
-# 4. 方向构造（4 来源 × K_per_source）
+# 4. 方向构造（K is the exact total budget across five direction families
+#    plus one deterministic edit-gradient direction）
 # --------------------------------------------------------------------------- #
 def build_directions(
     factors: Dict,
-    K_per_source: int,
+    K_total: int,
     edit_txt: List[str],
     edit_tgt: List[str],
     model,
     tok,
     hparams,
-    eig_device: str = "cpu",
+    eig_device=COMPUTE_DEVICE,
 ) -> List[Dict]:
     """
     返回 [{V, source, c, e, rho, meta}]，V 已归一化到 ||V||_F = 1。
@@ -298,37 +341,64 @@ def build_directions(
       (a) top_cap : cap_B 顶部特征向量 ⊗ cap_A 顶部特征向量（H_c 主方向）
       (b) generalized : 取 top-ρ / bottom-ρ / 随机广义特征方向
       (c) random : 高斯随机方向
-      (d) edit_gradient : L_edit 一次反向得 g，归一化 ±g
+      (d) edit_gradient : L_edit 一次反向得到的下降方向
     """
+    if K_total < 1:
+        raise ValueError("K must be at least 1")
+
+    # K is an exact unique-direction budget. One slot is reserved for the
+    # deterministic edit-gradient direction; the remaining slots are split
+    # across five candidate families so the final count is exactly K.
+    family_names = (
+        "top_cap", "gen_top", "gen_bottom", "gen_random", "random"
+    )
+    remaining = K_total - 1  # reserve one deterministic edit-gradient direction
+    base_count, remainder = divmod(remaining, len(family_names))
+    family_counts = {
+        name: base_count + (index < remainder)
+        for index, name in enumerate(family_names)
+    }
+
     cap_A, cap_B = factors["cap_A"], factors["cap_B"]
     edit_A, edit_B = factors["edit_A"], factors["edit_B"]
     out_dim, in_dim = factors["out_dim"], factors["in_dim"]
     damping = float(getattr(hparams, "newton_damping", 1e-5))
 
     directions: List[Dict] = []
+    print("[dirs] computing edit gradient for direction orientation ...")
+    # The gradient is used only to orient candidates, not to select their
+    # curvature score. This keeps the candidate comparison interpretable.
+    edit_grad = _compute_edit_gradient(
+        model, tok, edit_txt, edit_tgt, factors["weight_param"]
+    )
 
     # ---- (a) top_cap：分别 eigh cap_A / cap_B，取顶部 K 个张量积 ----
-    print("[dirs] (a) top_cap: eigh(cap_A)/eigh(cap_B) on CPU ...")
+    print(f"[dirs] (a) top_cap: eigh(cap_A)/eigh(cap_B) on {eig_device} ...")
     eig_a_vals, eig_a_vecs = torch.linalg.eigh(cap_A.to(eig_device))   # 升序
     eig_b_vals, eig_b_vecs = torch.linalg.eigh(cap_B.to(eig_device))
     # 顶部（最大特征值）= 末尾 K 个
-    top_a = eig_a_vecs[:, -K_per_source:]   # [in, K]
-    top_b = eig_b_vecs[:, -K_per_source:]   # [out, K]
+    top_count = family_counts["top_cap"]
+    top_a = eig_a_vecs[:, -top_count:] if top_count else eig_a_vecs[:, :0]
+    top_b = eig_b_vecs[:, -top_count:] if top_count else eig_b_vecs[:, :0]
     cnt = 0
-    for i in range(K_per_source):
-        for j in range(K_per_source):
-            if cnt >= K_per_source:
+    for i in range(top_count):
+        for j in range(top_count):
+            if cnt >= top_count:
                 break
             V = torch.outer(top_b[:, j], top_a[:, i])  # [out, in]
-            V = normalize_frobenius(V)
-            c = kfac_quad_form(V, cap_A, cap_B)
-            e = kfac_quad_form(V, edit_A, edit_B)
-            directions.append({"V": V, "source": "top_cap",
-                               "c": c, "e": e, "rho": c / (e + EPS_RHO),
-                               "meta": {"a_eig": float(eig_a_vals[-(i + 1)]),
-                                        "b_eig": float(eig_b_vals[-(j + 1)])}})
+            directions.append(_finalize_direction(
+                V,
+                "top_cap",
+                {"a_eig": float(eig_a_vals[-(i + 1)]),
+                 "b_eig": float(eig_b_vals[-(j + 1)])},
+                edit_grad,
+                cap_A,
+                cap_B,
+                edit_A,
+                edit_B,
+            ))
             cnt += 1
-        if cnt >= K_per_source:
+        if cnt >= top_count:
             break
 
     # ---- (b) generalized：A 侧与 B 侧广义特征分解，ρ_ij = outer(eig_b, eig_a) ----
@@ -338,71 +408,86 @@ def build_directions(
     # 1) top-ρ：取外积最大的若干 (i,j)
     rho_outer = torch.outer(eig_b_gen, eig_a_gen)  # [out, in] = ρ_ij
     flat = rho_outer.flatten()
-    top_rho_idx = torch.argsort(flat, descending=True)[:K_per_source].tolist()
+    top_rho_idx = torch.argsort(flat, descending=True)[:family_counts["gen_top"]].tolist()
     for idx in top_rho_idx:
         j, i = divmod(idx, eig_a_gen.shape[0])  # i 沿 in, j 沿 out
         V = torch.outer(q_b[:, j], q_a[:, i])
-        V = normalize_frobenius(V)
-        c = kfac_quad_form(V, cap_A, cap_B)
-        e = kfac_quad_form(V, edit_A, edit_B)
-        directions.append({"V": V, "source": "generalized",
-                           "c": c, "e": e, "rho": c / (e + EPS_RHO),
-                           "meta": {"kind": "top_rho", "rho_outer": float(flat[idx]),
-                                    "a_eig": float(eig_a_gen[i]), "b_eig": float(eig_b_gen[j])}})
+        directions.append(_finalize_direction(
+            V,
+            "generalized",
+            {"kind": "top_rho", "rho_outer": float(flat[idx]),
+             "a_eig": float(eig_a_gen[i]), "b_eig": float(eig_b_gen[j])},
+            edit_grad,
+            cap_A,
+            cap_B,
+            edit_A,
+            edit_B,
+        ))
     # 2) bottom-ρ（最安全方向）
-    bot_rho_idx = torch.argsort(flat, descending=False)[:K_per_source].tolist()
+    bot_rho_idx = torch.argsort(flat, descending=False)[:family_counts["gen_bottom"]].tolist()
     for idx in bot_rho_idx:
         j, i = divmod(idx, eig_a_gen.shape[0])
         V = torch.outer(q_b[:, j], q_a[:, i])
-        V = normalize_frobenius(V)
-        c = kfac_quad_form(V, cap_A, cap_B)
-        e = kfac_quad_form(V, edit_A, edit_B)
-        directions.append({"V": V, "source": "generalized",
-                           "c": c, "e": e, "rho": c / (e + EPS_RHO),
-                           "meta": {"kind": "bottom_rho", "rho_outer": float(flat[idx]),
-                                    "a_eig": float(eig_a_gen[i]), "b_eig": float(eig_b_gen[j])}})
+        directions.append(_finalize_direction(
+            V,
+            "generalized",
+            {"kind": "bottom_rho", "rho_outer": float(flat[idx]),
+             "a_eig": float(eig_a_gen[i]), "b_eig": float(eig_b_gen[j])},
+            edit_grad,
+            cap_A,
+            cap_B,
+            edit_A,
+            edit_B,
+        ))
     # 3) 随机广义方向
     rng = torch.Generator(device="cpu").manual_seed(SEED)
     n_a, n_b = eig_a_gen.shape[0], eig_b_gen.shape[0]
-    for _ in range(K_per_source):
+    for _ in range(family_counts["gen_random"]):
         i = int(torch.randint(0, n_a, (1,), generator=rng).item())
         j = int(torch.randint(0, n_b, (1,), generator=rng).item())
         V = torch.outer(q_b[:, j], q_a[:, i])
-        V = normalize_frobenius(V)
-        c = kfac_quad_form(V, cap_A, cap_B)
-        e = kfac_quad_form(V, edit_A, edit_B)
-        directions.append({"V": V, "source": "generalized",
-                           "c": c, "e": e, "rho": c / (e + EPS_RHO),
-                           "meta": {"kind": "random_gen", "a_eig": float(eig_a_gen[i]),
-                                    "b_eig": float(eig_b_gen[j])}})
+        directions.append(_finalize_direction(
+            V,
+            "generalized",
+            {"kind": "random_gen", "a_eig": float(eig_a_gen[i]),
+             "b_eig": float(eig_b_gen[j])},
+            edit_grad,
+            cap_A,
+            cap_B,
+            edit_A,
+            edit_B,
+        ))
 
     # ---- (c) random：高斯随机方向 ----
     print("[dirs] (c) random: gaussian directions ...")
-    for _ in range(K_per_source):
+    for _ in range(family_counts["random"]):
         V = torch.randn(out_dim, in_dim, generator=torch.Generator(device="cpu").manual_seed(SEED + len(directions)))
-        V = normalize_frobenius(V)
-        c = kfac_quad_form(V, cap_A, cap_B)
-        e = kfac_quad_form(V, edit_A, edit_B)
-        directions.append({"V": V, "source": "random",
-                           "c": c, "e": e, "rho": c / (e + EPS_RHO), "meta": {}})
+        directions.append(_finalize_direction(
+            V, "random", {}, edit_grad, cap_A, cap_B, edit_A, edit_B
+        ))
 
     # ---- (d) edit_gradient：L_edit 一次反向 ----
-    print("[dirs] (d) edit_gradient: one backward on L_edit ...")
-    grad = _compute_edit_gradient(model, tok, edit_txt, edit_tgt, factors["weight_param"])
-    g_norm = grad.norm().item()
+    print("[dirs] (d) edit_gradient: oriented descent direction ...")
+    g_norm = edit_grad.norm().item()
     if g_norm < 1e-30:
         raise RuntimeError("edit gradient has near-zero norm; cannot form edit_gradient direction")
-    # 下降方向 -g（好编辑）+ 上升方向 +g（对照）
-    for sign, tag in ((-1.0, "descent"), (1.0, "ascent")):
-        V = (sign * grad / g_norm)
-        c = kfac_quad_form(V, cap_A, cap_B)
-        e = kfac_quad_form(V, edit_A, edit_B)
-        directions.append({"V": V, "source": "edit_gradient",
-                           "c": c, "e": e, "rho": c / (e + EPS_RHO),
-                           "meta": {"sign": tag, "grad_norm": g_norm}})
+    directions.append(_finalize_direction(
+        -edit_grad / g_norm,
+        "edit_gradient",
+        {"sign": "descent", "grad_norm": g_norm},
+        edit_grad,
+        cap_A,
+        cap_B,
+        edit_A,
+        edit_B,
+    ))
 
     print(f"[dirs] built {len(directions)} directions "
           f"(sources: " + ", ".join(f"{s}={sum(1 for d in directions if d['source']==s)}" for s in SOURCE_NAMES) + ")")
+    if len(directions) != K_total:
+        raise RuntimeError(
+            f"direction budget mismatch: requested K={K_total}, built {len(directions)}"
+        )
     return directions
 
 
@@ -417,7 +502,7 @@ def _compute_edit_gradient(
     # 只让目标层可导，其它冻结
     model.eval()
     txt_edit, tgt_eval = edit_txt, edit_tgt
-    batch_size = 1
+    batch_size = 32
     grad_acc = None
     n_tokens = 0
 
@@ -458,15 +543,143 @@ def _compute_edit_gradient(
     return grad_acc.to("cpu", dtype=torch.float32).contiguous()
 
 
+def _finalize_direction(
+    V: torch.Tensor,
+    source: str,
+    meta: Dict,
+    edit_grad: torch.Tensor,
+    cap_A: torch.Tensor,
+    cap_B: torch.Tensor,
+    edit_A: torch.Tensor,
+    edit_B: torch.Tensor,
+) -> Dict:
+    """Normalize, orient, and score one candidate direction.
+
+    Curvature scores are unchanged by V -> -V, but the edit-loss slope is not.
+    We therefore flip every candidate into the half-space expected to improve
+    the edit objective before measuring finite-step behavior.
+    """
+    V = normalize_frobenius(V)
+    grad = edit_grad.to(device=V.device, dtype=V.dtype)
+    g_v = float((grad * V).sum().item())
+    flipped = g_v > 0.0
+    if flipped:
+        V = -V
+        g_v = -g_v
+
+    c = kfac_quad_form(V, cap_A, cap_B)
+    e = kfac_quad_form(V, edit_A, edit_B)
+    direction_meta = dict(meta)
+    direction_meta["flipped_to_descent"] = flipped
+    return {
+        "V": V,
+        "source": source,
+        "c": c,
+        "e": e,
+        "rho": c / (e + EPS_RHO),
+        "edit_slope": -g_v,
+        "meta": direction_meta,
+    }
+
+
+def build_edit_batches(
+    tok, edit_txt: List[str], edit_tgt: List[str], batch_size: int = 32
+) -> List[Dict]:
+    """
+    # Tokenization and padding are deterministic, so materialize them once
+    # and reuse the CPU batches for every direction/step trial.
+    预分词编辑样本并按 batch_size 打包 padding，构造 labels（prompt + pad 位置置 -100）。
+    全程复用，省掉 measure_pair 内 K×N_alpha 次的重复分词。
+    数值与 calculate_request_loss 一致：sample_size == len(edit_txt) 时无随机抽样，
+    prompt_len = len(tok.encode(prompt, add_special_tokens=True))，pad 位置由
+    labels[labels == pad_id] = -100 统一 mask。
+    返回 List[{input_ids, attention_mask, labels}]（CPU long）。
+    """
+    pad_id = tok.pad_token_id
+    fill_id = pad_id if pad_id is not None else 0
+
+    encoded: List[Tuple[List[int], int]] = []
+    for t, g in zip(edit_txt, edit_tgt):
+        ids = tok(t + g, return_tensors=None, add_special_tokens=True)["input_ids"]
+        prompt_len = len(tok.encode(t, add_special_tokens=True))
+        encoded.append((ids, prompt_len))
+
+    batches: List[Dict] = []
+    for chunk in _chunks(encoded, batch_size):
+        max_len = max(len(ids) for ids, _ in chunk)
+        input_ids = torch.full((len(chunk), max_len), fill_id, dtype=torch.long)
+        attention_mask = torch.zeros((len(chunk), max_len), dtype=torch.long)
+        labels = torch.full((len(chunk), max_len), -100, dtype=torch.long)
+        for i, (ids, prompt_len) in enumerate(chunk):
+            L = len(ids)
+            ids_t = torch.tensor(ids, dtype=torch.long)
+            input_ids[i, :L] = ids_t
+            attention_mask[i, :L] = 1
+            labels[i, :L] = ids_t
+        # 与 calculate_request_loss 一致：先 mask 所有 pad_id 位置（含 padding），再 mask prompt 前缀
+        if pad_id is not None:
+            labels[labels == pad_id] = -100
+        for i, (_, prompt_len) in enumerate(chunk):
+            labels[i, :prompt_len] = -100
+        batches.append({
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        })
+    return batches
+
+
+def edit_loss(model, edit_batches: List[Dict]) -> float:
+    """
+    # Only target tokens contribute: prompt tokens are context, not the edit
+    # objective being improved.
+    批量计算 L_edit（target_new token 的平均 CE），与 calculate_request_loss 数值一致。
+    累加在 GPU 标量张量上，循环结束一次性 .item()。
+    """
+    model.eval()
+    total_loss = torch.zeros((), device=model.device, dtype=torch.float32)
+    total_tokens = torch.zeros((), device=model.device, dtype=torch.float32)
+    with torch.no_grad():
+        for batch in edit_batches:
+            batch = dict_to_(batch, model.device)
+            outputs = model(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                use_cache=False,
+            )
+            logits = outputs.logits
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = batch["labels"][..., 1:].contiguous()
+            loss = torch.nn.functional.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100,
+                reduction="sum",
+            )
+            total_loss += loss
+            total_tokens += (shift_labels != -100).sum()
+
+    tt = total_tokens.item()
+    if tt == 0:
+        return 0.0
+    return total_loss.item() / tt
+
+
 # --------------------------------------------------------------------------- #
 # 5. 能力 KL（参照 calculate_cache_loss 数据管线，CE→KL 改造）
 # --------------------------------------------------------------------------- #
-def build_capability_loader(model, tok, ds_name: str, sample_size: int, batch_tokens: int):
-    """构造能力评测数据 loader（wikipedia val 子集）。"""
+def build_capability_batches(
+    tok, ds_name: str, sample_size: int, batch_tokens: int
+) -> List[Dict]:
+    """
+    # The same capability examples must be reused for every perturbation;
+    # otherwise changes in the sampled data would be mixed into Delta C.
+    预分词 + 预采样，把能力评测数据一次性物化成固定 batch 列表（CPU 张量）。
+    采样种子/数量固定（random_sample=SEED, sample_size=N_cap），故每次测量结果一致——
+    物化一次后供全部 measure_pair 复用，省掉 K×N_alpha 次的数据加载/分词/成桶开销。
+    返回 List[batch_dict]，每个 batch_dict 含 input_ids/position_ids/attention_mask（CPU）。
+    """
     raw_ds = load_stats_ds(ds_name)
-    maxlen = get_max_length_from_model(model)
-    if batch_tokens is not None and batch_tokens < maxlen:
-        maxlen = batch_tokens
     maxlen = 512  # 与 calculate_cache_loss 一致
     ds = TokenizedDataset(raw_ds["val"], tok, maxlen=maxlen)
     loader = make_loader(
@@ -478,7 +691,11 @@ def build_capability_loader(model, tok, ds_name: str, sample_size: int, batch_to
         random_sample=SEED,
         num_workers=0,
     )
-    return loader
+    batches: List[Dict] = []
+    for batch_group in loader:
+        for batch in batch_group:
+            batches.append(batch)
+    return batches
 
 
 def _forward_logits(model, batch) -> torch.Tensor:
@@ -490,74 +707,75 @@ def _forward_logits(model, batch) -> torch.Tensor:
 def capability_kl(
     model,
     tok,
-    ds_name: str,
-    layer_weight: torch.nn.Parameter,
-    theta0: torch.Tensor,
-    sample_size: int,
-    batch_tokens: int,
+    batches: List[Dict],
     ref_cache: Optional[List[torch.Tensor]] = None,
 ) -> Tuple[float, Optional[List[torch.Tensor]]]:
     """
+    # ref_cache must represent theta_0. measure_pair creates it before changing
+    # the weight when caching is disabled, then this function evaluates theta'.
     计算 D_cap(θ',θ_0) = (1/N) Σ_t KL(p_θ0(·|x_t) ‖ p_θ'(·|x_t))，按 token 平均。
-    ref_cache：若提供，则跳过 θ_0 的前向（已缓存 ref logits）；否则现场前向 θ_0。
+    batches：由 build_capability_batches 预构建的固定 batch 列表（CPU 张量，全程复用）。
+    ref_cache：若提供，则跳过 θ_0 的前向（已缓存 ref logits）；否则现场前向 θ_0 并缓存。
     返回 (kl_value, ref_cache_out)。ref_cache_out 为 None 时不缓存。
+
+    优化点（相比原版）：
+      - 不再每次重建 loader / 重载数据集 / 重新分词；
+      - 累加在 GPU 标量张量上，循环结束一次性 .item()，去掉每 batch 同步；
+      - 删除每 batch 的 torch.cuda.empty_cache()（~20k 次同步的反模式）。
     """
-    loader = build_capability_loader(model, tok, ds_name, sample_size, batch_tokens)
     pad_id = tok.pad_token_id
     model_dtype = next(model.parameters()).dtype
 
-    total_kl = 0.0
-    total_tokens = 0
+    total_kl = torch.zeros((), device=model.device, dtype=torch.float32)
+    total_tokens = torch.zeros((), device=model.device, dtype=torch.float32)
     new_cache: Optional[List[torch.Tensor]] = [] if ref_cache is None else None
     cache_idx = 0
 
     model.eval()
     with torch.no_grad():
-        for batch_group in loader:
-            for batch in batch_group:
-                labels = batch["input_ids"].clone()
-                labels[labels == 0] = -100
-                if pad_id is not None:
-                    labels[labels == pad_id] = -100
-                # 参考分布（θ_0）：现场前向或读缓存
-                if ref_cache is None:
-                    ref_logits = _forward_logits(model, batch).float()
-                    if new_cache is not None:
-                        # fp16 落盘省一半 CPU 内存（vocab 128256 × tokens 较大）
-                        new_cache.append(ref_logits.to(torch.float16).cpu())
-                else:
-                    ref_logits = ref_cache[cache_idx].to(
-                        model.device, dtype=model_dtype
-                    ).float()
-                    cache_idx += 1
+        for batch in batches:
+            labels = batch["input_ids"].clone()
+            labels[labels == 0] = -100
+            if pad_id is not None:
+                labels[labels == pad_id] = -100
+            # 参考分布（θ_0）：现场前向或读缓存
+            if ref_cache is None:
+                ref_logits = _forward_logits(model, batch).float()
+                if new_cache is not None:
+                    # fp16 落盘省一半 CPU 内存（vocab 128256 × tokens 较大）
+                    new_cache.append(ref_logits.to(torch.float16).cpu())
+            else:
+                ref_logits = ref_cache[cache_idx].to(
+                    model.device, dtype=model_dtype
+                ).float()
+                cache_idx += 1
 
-                # 当前分布（θ'）：要求调用方已把权重改到 θ' 再调用
-                cur_logits = _forward_logits(model, batch).float()
+            # 当前分布（θ'）：要求调用方已把权重改到 θ' 再调用
+            cur_logits = _forward_logits(model, batch).float()
 
-                # shift：tokens < n predict n
-                shift_ref = ref_logits[..., :-1, :].contiguous()
-                shift_cur = cur_logits[..., :-1, :].contiguous()
-                shift_labels = labels[..., 1:].contiguous()
+            # shift：tokens < n predict n
+            shift_ref = ref_logits[..., :-1, :].contiguous()
+            shift_cur = cur_logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
 
-                mask = (shift_labels != -100)
-                log_ref = torch.log_softmax(shift_ref, dim=-1)
-                log_cur = torch.log_softmax(shift_cur, dim=-1)
-                p_ref = log_ref.exp()
-                kl_tok = (p_ref * (log_ref - log_cur)).sum(dim=-1)  # [B, T-1]
-                kl_tok = torch.clamp(kl_tok, max=KL_PER_TOKEN_CLAMP)
+            mask = (shift_labels != -100)
+            log_ref = torch.log_softmax(shift_ref, dim=-1)
+            log_cur = torch.log_softmax(shift_cur, dim=-1)
+            p_ref = log_ref.exp()
+            kl_tok = (p_ref * (log_ref - log_cur)).sum(dim=-1)  # [B, T-1]
+            kl_tok = torch.clamp(kl_tok, max=KL_PER_TOKEN_CLAMP)
 
-                kl_sum = (kl_tok * mask.float()).sum().item()
-                ntok = mask.sum().item()
-                total_kl += kl_sum
-                total_tokens += ntok
+            mask = mask.to(kl_tok.device)
+            total_kl += (kl_tok * mask.float()).sum()
+            total_tokens += mask.sum()
 
-                del ref_logits, cur_logits, shift_ref, shift_cur, log_ref, log_cur, p_ref
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+            del ref_logits, cur_logits, shift_ref, shift_cur, log_ref, log_cur, p_ref
 
-    if total_tokens == 0:
+    total_kl_v = total_kl.item()
+    total_tokens_v = total_tokens.item()
+    if total_tokens_v == 0:
         return 0.0, (new_cache if ref_cache is None else None)
-    return total_kl / total_tokens, (new_cache if ref_cache is None else None)
+    return total_kl_v / total_tokens_v, (new_cache if ref_cache is None else None)
 
 
 # --------------------------------------------------------------------------- #
@@ -569,34 +787,39 @@ def measure_pair(
     factors: Dict,
     V_k: torch.Tensor,
     alpha: float,
-    edit_txt: List[str],
-    edit_tgt: List[str],
-    cap_ds_name: str,
-    N_cap: int,
-    batch_tokens: int,
+    edit_batches: List[Dict],
+    cap_batches: List[Dict],
     ref_cache: Optional[List[torch.Tensor]],
 ) -> Tuple[float, float, float]:
     """
+    # This is a transactional probe: modify exactly one layer, measure both
+    # effects, and restore theta_0 in finally even if a forward pass fails.
     在 θ_0 + α·V_k 下测量 (ΔE, ΔC, R)。
     save-modify-restore：用 .copy_() 原地改单层权重，try/finally 必恢复。
+    edit_batches：预构建的编辑 batch 列表（批量前向，替代 calculate_request_loss 的逐条 batch=1）。
+    cap_batches：预构建的能力评测 batch 列表（全程复用）。
     """
     weight_param = factors["weight_param"]
     theta0 = factors["theta0"]
     device = weight_param.device
     V_dev = V_k.to(device=device, dtype=weight_param.dtype)
+    effective_ref_cache = ref_cache
+    if effective_ref_cache is None:
+        # Build the reference while the model is still exactly at theta_0.
+        # Doing this after the perturbation would compare theta' with itself.
+        _, effective_ref_cache = capability_kl(
+            model, tok, cap_batches, ref_cache=None,
+        )
 
     try:
         # θ_0 + α·V_k（就地修改，保 device_map 分片）
         weight_param.data.copy_(theta0 + alpha * V_dev)
 
         # ΔE 的 θ' 侧：L_edit(θ_0+αV_k)；baseline L_edit(θ_0) 由调用方预先算好
-        edit_loss_prime = calculate_request_loss(
-            model, tok, edit_txt, edit_tgt, sample_size=len(edit_txt)
-        )
+        edit_loss_prime = edit_loss(model, edit_batches)
         # ΔC：此时权重在 θ'，KL(p_θ0 ‖ p_θ')；ref_cache 提供 θ_0 的 logits 避免重算
         delta_C, _ = capability_kl(
-            model, tok, cap_ds_name, weight_param, theta0,
-            sample_size=N_cap, batch_tokens=batch_tokens, ref_cache=ref_cache,
+            model, tok, cap_batches, ref_cache=effective_ref_cache,
         )
     finally:
         weight_param.data.copy_(theta0)
@@ -641,30 +864,110 @@ def topk_precision(predictor: List[float], target: List[float], ks: List[int]) -
     return out
 
 
+def _bootstrap_spearman_difference(
+    records: List[Dict], n_bootstrap: int = 2000
+) -> Dict:
+    """Stratified direction-level CI for Spearman(rho,R)-Spearman(c,R).
+
+    Resampling within source keeps the source mixture fixed and avoids treating
+    the four line-search trials of one direction as independent observations.
+    """
+    if len(records) < 3:
+        return {"n": len(records), "n_bootstrap": 0, "ci95": None}
+
+    try:
+        from scipy.stats import spearmanr
+    except Exception as exc:
+        return {"n": len(records), "n_bootstrap": 0, "error": str(exc)}
+
+    source_indices = {}
+    for index, record in enumerate(records):
+        source_indices.setdefault(record["source"], []).append(index)
+
+    rng = np.random.default_rng(SEED)
+    differences = []
+    for _ in range(n_bootstrap):
+        sampled = []
+        for indices in source_indices.values():
+            sampled.extend(rng.choice(indices, size=len(indices), replace=True))
+        c = [records[index]["c"] for index in sampled]
+        rho = [records[index]["rho"] for index in sampled]
+        target = [records[index]["R"] for index in sampled]
+        # Tuple unpacking works with both SciPy 1.9's SpearmanrResult
+        # (correlation, pvalue) and newer SignificanceResult versions
+        # (statistic, pvalue).
+        c_corr, _ = spearmanr(c, target)
+        rho_corr, _ = spearmanr(rho, target)
+        c_corr = float(c_corr)
+        rho_corr = float(rho_corr)
+        difference = rho_corr - c_corr
+        if np.isfinite(difference):
+            differences.append(difference)
+
+    if not differences:
+        return {"n": len(records), "n_bootstrap": 0, "ci95": None}
+    low, high = np.quantile(differences, [0.025, 0.975])
+    return {
+        "n": len(records),
+        "n_bootstrap": len(differences),
+        "mean": float(np.mean(differences)),
+        "ci95": [float(low), float(high)],
+    }
+
+
 def correlate_and_plot(records: List[Dict], out_dir: str) -> Dict:
     os.makedirs(out_dir, exist_ok=True)
 
-    # 汇总（全 α 合并）
-    c_all = [r["c"] for r in records]
-    rho_all = [r["rho"] for r in records]
-    R_all = [r["R"] for r in records]
+    # Persist the expensive direction measurements before optional statistical
+    # analysis or plotting, so a dependency/version error cannot discard them.
+    with open(os.path.join(out_dir, "metrics.json"), "w", encoding="utf-8") as f:
+        json.dump(records, f, indent=2, ensure_ascii=False)
+
+    # Only the selected primary record per direction enters the endpoint. The
+    # line-search trials remain attached to the record for diagnostics, while
+    # invalid directions cannot manufacture a positive denominator for R.
+    valid_records = [
+        r for r in records
+        if r.get("valid", False)
+        and r.get("R") is not None
+        and np.isfinite(r["R"])
+    ]
+    c_all = [r["c"] for r in valid_records]
+    rho_all = [r["rho"] for r in valid_records]
+    R_all = [r["R"] for r in valid_records]
 
     corr_summary = {
+        "n_total_directions": len(records),
+        "n_valid_directions": len(valid_records),
+        "n_invalid_directions": len(records) - len(valid_records),
         "overall": {
             "c_vs_R": _safe_corr(c_all, R_all),
             "rho_vs_R": _safe_corr(rho_all, R_all),
         },
-        "by_alpha": {},
+        "by_source": {},
+        "by_selected_alpha": {},
     }
 
-    # 按 α 分组
-    alphas = sorted(set(r["alpha"] for r in records))
+    for source in sorted({r["source"] for r in valid_records}):
+        sub = [r for r in valid_records if r["source"] == source]
+        target = [r["R"] for r in sub]
+        corr_summary["by_source"][source] = {
+            "c_vs_R": _safe_corr([r["c"] for r in sub], target),
+            "rho_vs_R": _safe_corr([r["rho"] for r in sub], target),
+        }
+
+    bootstrap = _bootstrap_spearman_difference(valid_records)
+    corr_summary["spearman_difference_bootstrap"] = bootstrap
+
+    # Selected-alpha groups are diagnostics only; the primary endpoint uses
+    # exactly one independently selected record per direction.
+    alphas = sorted(set(r["alpha"] for r in valid_records))
     for a in alphas:
-        sub = [r for r in records if abs(r["alpha"] - a) < 1e-15]
+        sub = [r for r in valid_records if abs(r["alpha"] - a) < 1e-15]
         c_a = [r["c"] for r in sub]
         rho_a = [r["rho"] for r in sub]
         R_a = [r["R"] for r in sub]
-        corr_summary["by_alpha"][f"{a:.1e}"] = {
+        corr_summary["by_selected_alpha"][f"{a:.1e}"] = {
             "c_vs_R": _safe_corr(c_a, R_a),
             "rho_vs_R": _safe_corr(rho_a, R_a),
             "topk_c": topk_precision(c_a, R_a, [5, 10, 20]),
@@ -675,13 +978,20 @@ def correlate_and_plot(records: List[Dict], out_dir: str) -> Dict:
     ov_c = corr_summary["overall"]["c_vs_R"]
     ov_rho = corr_summary["overall"]["rho_vs_R"]
     if ov_c.get("spearman_r") is not None and ov_rho.get("spearman_r") is not None:
-        better = abs(ov_rho["spearman_r"]) > abs(ov_c["spearman_r"])
+        ci95 = bootstrap.get("ci95")
+        better = (
+            ov_rho["spearman_r"] > 0.0
+            and ov_rho["spearman_r"] > ov_c["spearman_r"]
+            and ci95 is not None
+            and ci95[0] > 0.0
+        )
         corr_summary["verdict"] = (
-            "rho_stronger_than_c" if better else "c_not_worse_or_stronger"
+            "rho_stronger_than_c" if better else "rho_advantage_not_established"
         )
         corr_summary["verdict_detail"] = (
-            f"|Spearman(ρ,R)|={abs(ov_rho['spearman_r']):.4f} vs "
-            f"|Spearman(c,R)|={abs(ov_c['spearman_r']):.4f}"
+            f"Spearman(rho,R)={ov_rho['spearman_r']:.4f} vs "
+            f"Spearman(c,R)={ov_c['spearman_r']:.4f}; "
+            f"stratified bootstrap CI95(delta)={ci95}"
         )
     else:
         corr_summary["verdict"] = "insufficient_samples"
@@ -689,8 +999,10 @@ def correlate_and_plot(records: List[Dict], out_dir: str) -> Dict:
     # 写 JSON
     with open(os.path.join(out_dir, "correlations.json"), "w", encoding="utf-8") as f:
         json.dump(corr_summary, f, indent=2, ensure_ascii=False)
-    with open(os.path.join(out_dir, "metrics.json"), "w", encoding="utf-8") as f:
-        json.dump(records, f, indent=2, ensure_ascii=False)
+
+    if not valid_records:
+        print("[plot] no valid directions; skipping figures")
+        return corr_summary
 
     # 绘图（可选，matplotlib 缺失则跳过）
     try:
@@ -705,7 +1017,7 @@ def correlate_and_plot(records: List[Dict], out_dir: str) -> Dict:
             fig, ax = plt.subplots(figsize=(6, 5))
             colors = {"top_cap": "tab:blue", "generalized": "tab:orange",
                       "random": "tab:green", "edit_gradient": "tab:red"}
-            for r in records:
+            for r in valid_records:
                 ax.scatter(r["x"] if False else (r["c"] if fname.startswith("fig_a") else r["rho"]),
                            r["R"], s=12, alpha=0.6,
                            color=colors.get(r["source"], "gray"))
@@ -731,15 +1043,21 @@ def correlate_and_plot(records: List[Dict], out_dir: str) -> Dict:
 # --------------------------------------------------------------------------- #
 def self_check_kronecker(factors: Dict, block: int = 256) -> None:
     """
-    小子块上验证 trace(B V A V^T) ≈ vec(V)^T(A⊗B)vec(V)。
-    用 cap_A/cap_B（保证同源的 K-FAC Fisher 结构），显式构造 Kronecker 积对照。
+    小子块上验证 trace(B V A V^T) = vec(V)^T (B^T ⊗ A) vec(V)。
+    用 cap_A/cap_B（同源 K-FAC Fisher 结构）显式构造 Kronecker 积对照。
+
+    注意 vec 顺序：torch 的 V.flatten() 是行优先 = 列优先 vec(V^T)，
+    故 Kronecker 因子必须是 (B^T ⊗ A)，而不是 (A ⊗ B)——
+    两者仅经换位置换才相等，直接用 (A⊗B) 会引入 ~1e-2 量级的虚假误差。
     """
-    A = factors["cap_A"][:block, :block].clone()
-    B = factors["cap_B"][:block, :block].clone()
+    A = factors["cap_A"][:block, :block].clone().to("cpu")  # 自检固定 CPU，保证确定性
+    B = factors["cap_B"][:block, :block].clone().to("cpu")
     rng = torch.Generator(device="cpu").manual_seed(123)
     V = torch.randn(block, block, generator=rng)
     lhs = kfac_quad_form(V, A, B)
-    K = torch.kron(A, B)  # 仅小块可行：[block^2, block^2]
+    # trace(B V A V^T) = vec(V^T)^T (B^T ⊗ A) vec(V^T)；
+    # 行优先 flatten(V) = 列优先 vec(V^T)，故用 kron(B^T, A)。
+    K = torch.kron(B.t().contiguous(), A)  # 仅小块可行：[block^2, block^2]
     rhs = float((V.flatten() @ K @ V.flatten()).item())
     rel = abs(lhs - rhs) / (abs(rhs) + 1e-30)
     print(f"[self_check] Kronecker identity: trace={lhs:.6e} kron={rhs:.6e} rel_err={rel:.3e}")
@@ -806,39 +1124,158 @@ def get_edit_requests(data_type: str, N_edit: int) -> Tuple[List[str], List[str]
 # --------------------------------------------------------------------------- #
 # main
 # --------------------------------------------------------------------------- #
-def main():
+def _parse_layer_indices(
+    layer: Optional[int], layers: Optional[List[str]]
+) -> List[int]:
+    """Parse the legacy single-layer flag or the multi-layer flag."""
+    if layers is None:
+        return [19 if layer is None else layer]
+
+    parsed: List[int] = []
+    for value in layers:
+        for token in value.split(","):
+            token = token.strip()
+            if token:
+                parsed.append(int(token))
+    if not parsed:
+        raise ValueError("--layers must contain at least one layer index")
+    if len(set(parsed)) != len(parsed):
+        raise ValueError(f"duplicate layer index in --layers: {parsed}")
+    return parsed
+
+
+def main(
+    argv=None,
+    _layer_override: Optional[int] = None,
+    _shared_model_state: Optional[Dict] = None,
+):
     parser = argparse.ArgumentParser(description="实验一：ρ vs H_c 核心假设验证")
     parser.add_argument("--model", default="llama3-8b")
-    parser.add_argument("--layer", type=int, default=19)
-    parser.add_argument("--K", type=int, default=60, help="总方向数（≈4来源×K/4）")
+    parser.add_argument("--layer", type=int, default=None,
+                        help="single layer index (legacy option; default: 19)")
+    parser.add_argument(
+        "--layers",
+        nargs="+",
+        default=None,
+        metavar="LAYER",
+        help="multiple layer indices, e.g. --layers 19 20 21 or --layers 19,20,21",
+    )
+    parser.add_argument("--K", type=int, default=60, help="最终唯一候选方向总数")
     parser.add_argument("--N_alpha", type=int, default=4)
     parser.add_argument("--N_cap", type=int, default=64, help="能力 KL 序列长度")
     parser.add_argument("--N_edit", type=int, default=20, help="编辑样本数")
+    parser.add_argument(
+        "--min_edit_gain",
+        type=float,
+        default=1e-8,
+        help="方向进入相关性分析所需的最小正编辑收益",
+    )
     parser.add_argument("--out_dir", default="logs/experiment1/")
     parser.add_argument("--data_type", default="wiki")
     parser.add_argument("--cap_ds", default=None, help="能力 KL 数据集（默认 mom2_dataset）")
     parser.add_argument("--batch_tokens", type=int, default=2048)
-    parser.add_argument("--cache_ref_logits", action="store_true",
-                        help="缓存 θ_0 的能力 logits（fp32），避免每次重算（显存换时间）")
+    parser.add_argument("--edit_batch_size", type=int, default=32,
+                        help="编辑 loss 前向批大小（原 calculate_request_loss 硬编码 batch=1）")
+    parser.add_argument("--no_cache_ref_logits", action="store_true",
+                        help="关闭 θ_0 能力 logits 缓存（默认开启；关闭后每次 measure 重算 θ_0 前向，慢约 2×）")
     parser.add_argument("--skip_self_check", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+
+    try:
+        layer_indices = _parse_layer_indices(args.layer, args.layers)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    if args.layer is not None and args.layers is not None:
+        parser.error("--layer and --layers are mutually exclusive")
+    if args.min_edit_gain < 0:
+        parser.error("--min_edit_gain must be non-negative")
+
+    # Multi-layer mode is a sequence of independent probes, not a joint update
+    # across layers. The model and cov-cache are shared; each layer still gets
+    # its own factors, directions, measurements, and output directory.
+    if _layer_override is None and len(layer_indices) > 1:
+        set_seed(SEED)
+        model, tok, hparams = load_model_and_hparams(args.model)
+        original_layers = list(hparams.layers)
+        hparams.layers = layer_indices
+        print(
+            f"[factors] requested layers={layer_indices}; "
+            f"hparams.layers {original_layers} -> {hparams.layers}"
+        )
+        layer_to_cov = _build_cov_cache_from_hparams(
+            model, tok, hparams, force_recompute=False
+        )
+        shared_model_state = {
+            "model": model,
+            "tok": tok,
+            "hparams": hparams,
+            "layer_to_cov": layer_to_cov,
+        }
+        summary = []
+        for layer_idx in layer_indices:
+            print(f"\n######## multi-layer run: layer {layer_idx} ########")
+            main(
+                argv,
+                _layer_override=layer_idx,
+                _shared_model_state=shared_model_state,
+            )
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            summary.append({
+                "layer_index": layer_idx,
+                "output_dir": os.path.join(args.out_dir, f"layer_{layer_idx}"),
+            })
+        os.makedirs(args.out_dir, exist_ok=True)
+        with open(
+            os.path.join(args.out_dir, "layers_summary.json"),
+            "w",
+            encoding="utf-8",
+        ) as handle:
+            json.dump(summary, handle, indent=2, ensure_ascii=False)
+        print(f"[done] multi-layer summary written to {args.out_dir}")
+        return summary
+
+    selected_layer = (
+        _layer_override
+        if _layer_override is not None
+        else layer_indices[0]
+    )
+    args.layer = selected_layer
+    args.layers = None
+    if _layer_override is not None:
+        args.out_dir = os.path.join(args.out_dir, f"layer_{selected_layer}")
 
     set_seed(SEED)
     os.makedirs(args.out_dir, exist_ok=True)
 
-    # K 分配到 4 来源
-    K_per_source = max(args.K // 4, 1)
+    if args.K < 1:
+        parser.error("--K must be at least 1")
     alphas_rel = ALPHAS_REL_DEFAULT[: args.N_alpha]
+    if not alphas_rel:
+        parser.error("--N_alpha must be at least 1")
 
     # 1) 模型 / 因子
-    model, tok, hparams = load_model_and_hparams(args.model)
-    # 把目标层临时设为单层：_build_cov_cache_from_hparams 会按 hparams.layers
-    # 逐层计算/加载 K-FAC；收窄为单层既省时（未缓存时）又只读必要缓存。
-    # 缓存路径按层名独立，收窄不影响 layer 19 的路径命中。
-    original_layers = list(hparams.layers)
-    hparams.layers = [args.layer]
-    print(f"[factors] restricted hparams.layers {original_layers} -> {hparams.layers}")
-    factors = build_factors(model, tok, hparams, args.layer)
+    if _shared_model_state is None:
+        model, tok, hparams = load_model_and_hparams(args.model)
+        original_layers = list(hparams.layers)
+        hparams.layers = [args.layer]
+        print(
+            f"[factors] restricted hparams.layers "
+            f"{original_layers} -> {hparams.layers}"
+        )
+        factors = build_factors(model, tok, hparams, args.layer)
+    else:
+        model = _shared_model_state["model"]
+        tok = _shared_model_state["tok"]
+        hparams = _shared_model_state["hparams"]
+        factors = build_factors(
+            model,
+            tok,
+            hparams,
+            args.layer,
+            layer_to_cov=_shared_model_state["layer_to_cov"],
+        )
 
     cap_ds = args.cap_ds or getattr(hparams, "mom2_dataset", "wikipedia")
 
@@ -852,32 +1289,46 @@ def main():
     edit_txt, edit_tgt = get_edit_requests(args.data_type, args.N_edit)
     print(f"[edit] {len(edit_txt)} edit samples from data_type={args.data_type}")
 
-    # 4) 方向构造
+    # 4) 方向构造：c/rho are predictors; edit_slope only orients candidates.
     print("\n=== 构造方向 ===")
     directions = build_directions(
-        factors, K_per_source, edit_txt, edit_tgt, model, tok, hparams, eig_device="cpu"
+        factors, args.K, edit_txt, edit_tgt, model, tok, hparams, eig_device=COMPUTE_DEVICE
     )
     if not args.skip_self_check:
         self_check_generalized_rho(directions)
 
-    # 5) baseline：L_edit(θ_0) 与 θ_0 能力 logits 缓存
+    # 5) Baseline: freeze the reference objective and materialize all reusable
+    # data before any weight perturbation is attempted.
     print("\n=== baseline ===")
-    baseline_edit_loss = calculate_request_loss(
-        model, tok, edit_txt, edit_tgt, sample_size=len(edit_txt)
-    )
-    print(f"[baseline] L_edit(θ_0) = {baseline_edit_loss:.6f}")
+    # Edit batches are reused across every K * N_alpha trial.
+    # 数值与 calculate_request_loss 一致（sample_size == len(edit_txt) 无随机抽样）。
+    edit_batches = build_edit_batches(tok, edit_txt, edit_tgt, batch_size=args.edit_batch_size)
+    baseline_edit_loss = edit_loss(model, edit_batches)
+    print(f"[baseline] L_edit(θ_0) = {baseline_edit_loss:.6f} "
+          f"({len(edit_batches)} edit batches, batch_size≤{args.edit_batch_size})")
 
+    # Capability batches are also fixed so Delta C compares models on the same
+    # token set rather than on a new random sample each time.
+    print(f"[baseline] building capability batches (cap_ds={cap_ds}, N_cap={args.N_cap}) ...")
+    cap_batches = build_capability_batches(
+        tok, cap_ds, sample_size=args.N_cap, batch_tokens=args.batch_tokens
+    )
+    print(f"[baseline] {len(cap_batches)} capability batches ready")
+
+    # θ_0 的能力 logits 缓存：KL 中 θ_0 全程不变，算一次即可。
+    # 默认开启（--no_cache_ref_logits 可关）；不缓存则每次 measure 重做 N_cap 次前向。
     ref_cache = None
-    if args.cache_ref_logits:
-        print("[baseline] caching θ_0 capability logits (fp32) ...")
-        # 权重当前即 θ_0（未被改过）
+    if not args.no_cache_ref_logits:
+        print("[baseline] caching θ_0 capability logits (fp16) ...")
+        # 权重当前即 θ_0（未被改过）；ref_cache=None 时现场前向并缓存
         _, ref_cache = capability_kl(
-            model, tok, cap_ds, factors["weight_param"], factors["theta0"],
-            sample_size=args.N_cap, batch_tokens=args.batch_tokens, ref_cache=None,
+            model, tok, cap_batches, ref_cache=None,
         )
         # ref_cache 现含 θ_0 的 logits；后续 measure 时传它避免重算 θ_0 前向
 
-    # 6) 测量循环
+    # 6) Measure each candidate on a small common alpha grid. The grid is used
+    # only to choose the edit-improving trial; it is not treated as K*N_alpha
+    # independent correlation samples.
     print("\n=== 测量 ===")
     theta0 = factors["theta0"]
     theta0_norm = theta0.norm().item()
@@ -885,11 +1336,13 @@ def main():
 
     records: List[Dict] = []
     n_deltaE_le0 = 0
+    n_failed_measurements = 0
     total = len(directions) * len(alphas_rel)
     done = 0
 
     for di, d in enumerate(directions):
         V_k = d["V"]
+        trials = []
         for alpha_rel in alphas_rel:
             alpha = alpha_rel * theta0_norm
             done += 1
@@ -897,48 +1350,92 @@ def main():
             try:
                 edit_loss_prime, delta_C, _ = measure_pair(
                     model, tok, factors, V_k, alpha,
-                    edit_txt, edit_tgt, cap_ds, args.N_cap, args.batch_tokens, ref_cache,
+                    edit_batches, cap_batches, ref_cache,
                 )
             except Exception as e:
                 print(f"  [warn] measure failed: {e}; skipping")
+                n_failed_measurements += 1
                 continue
 
             delta_E = baseline_edit_loss - edit_loss_prime
-            delta_E_eff = delta_E if delta_E > 0 else DELTA_E_FLOOR
             if delta_E <= 0:
                 n_deltaE_le0 += 1
-            R = delta_C / (delta_E_eff + EPS_RHO)
-
-            rec = {
-                "V_id": di,
-                "source": d["source"],
+            trial_valid = delta_E > args.min_edit_gain
+            trial_R = (
+                delta_C / (delta_E + EPS_RHO)
+                if trial_valid
+                else None
+            )
+            trials.append({
                 "alpha": alpha,
                 "alpha_rel": alpha_rel,
-                "c": d["c"],
-                "e": d["e"],
-                "rho": d["rho"],
-                "L_edit_theta0": baseline_edit_loss,
                 "L_edit_theta_prime": edit_loss_prime,
                 "delta_E": delta_E,
                 "delta_C": delta_C,
-                "R": R,
-                "meta": d.get("meta", {}),
-            }
-            records.append(rec)
+                "R": trial_R,
+                "valid": trial_valid,
+            })
             print(f"  c={d['c']:.4e} e={d['e']:.4e} ρ={d['rho']:.4e} "
-                  f"ΔE={delta_E:.4e} ΔC={delta_C:.4e} R={R:.4e}")
+                  f"ΔE={delta_E:.4e} ΔC={delta_C:.4e} "
+                  f"R={trial_R if trial_R is not None else 'invalid'}")
+
+        # Select using edit gain alone, independently of c/rho. This prevents
+        # the predictor under test from deciding which trial is retained.
+        best = max(trials, key=lambda trial: trial["delta_E"], default=None)
+        valid = best is not None and best["valid"]
+        record = {
+            "V_id": di,
+            "source": d["source"],
+            "c": d["c"],
+            "e": d["e"],
+            "rho": d["rho"],
+            "edit_slope": d["edit_slope"],
+            "alpha_quad": d["edit_slope"] / (d["e"] + EPS_RHO),
+            "L_edit_theta0": baseline_edit_loss,
+            "valid": valid,
+            "invalid_reason": None if valid else (
+                "no_positive_edit_gain" if best is not None
+                else "all_measurements_failed"
+            ),
+            "alpha": best["alpha"] if best is not None else None,
+            "alpha_rel": best["alpha_rel"] if best is not None else None,
+            "L_edit_theta_prime": (
+                best["L_edit_theta_prime"] if best is not None else None
+            ),
+            "delta_E": best["delta_E"] if best is not None else None,
+            "delta_C": best["delta_C"] if best is not None else None,
+            "R": best["R"] if valid else None,
+            "line_search": trials,
+            "meta": d.get("meta", {}),
+        }
+        records.append(record)
+        print(
+            f"[select] dir#{di} valid={valid} "
+            f"alpha_rel={record['alpha_rel']} delta_E={record['delta_E']} "
+            f"R={record['R']}"
+        )
 
     # 7) 全局恢复断言
     assert torch.allclose(weight_param.data, theta0, atol=RESTORE_ATOL), \
         "GLOBAL weight drift detected after all measurements"
 
-    # 8) α 无关性诊断 + 诊断 JSON
+    # 8) Diagnostics and JSON. Alpha sensitivity is retained as a diagnostic,
+    # while the endpoint remains one selected record per direction.
     diagnostics = {
         "n_directions": len(directions),
         "n_records": len(records),
+        "n_measurements": done,
+        "n_failed_measurements": n_failed_measurements,
+        "n_valid_directions": sum(r["valid"] for r in records),
+        "n_invalid_directions": sum(not r["valid"] for r in records),
         "n_alphas": len(alphas_rel),
         "alphas_rel": list(alphas_rel),
         "pct_deltaE_le0": (n_deltaE_le0 / max(done, 1)) * 100.0,
+        "pct_invalid_directions": (
+            sum(not r["valid"] for r in records) / max(len(records), 1)
+        ) * 100.0,
+        "selection_rule": "max_delta_E_over_fixed_alpha_grid",
+        "min_edit_gain": args.min_edit_gain,
         "theta0_norm": theta0_norm,
         "layer": factors["layer_name"],
         "cap_A_cond": float(
@@ -951,13 +1448,19 @@ def main():
         ),
         "baseline_edit_loss": baseline_edit_loss,
     }
-    # α 无关性：同一 V_id 跨 α 的 R 变化
+    # Step-size sensitivity is diagnostic only and does not add correlation samples.
     alpha_indep = {}
-    for di in sorted(set(r["V_id"] for r in records)):
-        rs = [r["R"] for r in records if r["V_id"] == di]
+    for record in records:
+        rs = [
+            trial["R"] for trial in record["line_search"]
+            if trial["R"] is not None
+        ]
         if len(rs) >= 2:
-            alpha_indep[di] = {"R_min": min(rs), "R_max": max(rs),
-                               "ratio": max(rs) / (min(rs) + EPS_RHO)}
+            alpha_indep[record["V_id"]] = {
+                "R_min": min(rs),
+                "R_max": max(rs),
+                "ratio": max(rs) / (min(rs) + EPS_RHO),
+            }
     diagnostics["alpha_independence"] = alpha_indep
 
     with open(os.path.join(args.out_dir, "diagnostics.json"), "w", encoding="utf-8") as f:
@@ -971,8 +1474,11 @@ def main():
         print("[warn] no records produced; nothing to correlate")
 
     print(f"\n[done] outputs in {args.out_dir}")
-    print(f"[diag] %ΔE≤0 = {diagnostics['pct_deltaE_le0']:.1f}%  "
-          f"(>30% suggests α too large)")
+    print(
+        f"[diag] invalid directions = "
+        f"{diagnostics['pct_invalid_directions']:.1f}%  "
+        f"trial %ΔE≤0 = {diagnostics['pct_deltaE_le0']:.1f}%"
+    )
     print(f"[diag] cap_A cond = {diagnostics['cap_A_cond']:.3e}  "
           f"edit_A cond = {diagnostics['edit_A_cond']:.3e}")
 

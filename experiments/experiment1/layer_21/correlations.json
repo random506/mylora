@@ -1,0 +1,162 @@
+{
+  "n_total_directions": 60,
+  "n_valid_directions": 60,
+  "n_invalid_directions": 0,
+  "overall": {
+    "c_vs_R": {
+      "n": 60,
+      "pearson_r": 0.048205109350680383,
+      "pearson_p": 0.7145492602781907,
+      "spearman_r": 0.5165879410947486,
+      "spearman_p": 2.3851768918140604e-05
+    },
+    "rho_vs_R": {
+      "n": 60,
+      "pearson_r": 0.7315869930418568,
+      "pearson_p": 3.1491706969377046e-11,
+      "spearman_r": 0.8559044178938596,
+      "spearman_p": 2.9669215000785755e-18
+    }
+  },
+  "by_source": {
+    "edit_gradient": {
+      "c_vs_R": {
+        "n": 1,
+        "pearson_r": null,
+        "pearson_p": null,
+        "spearman_r": null,
+        "spearman_p": null
+      },
+      "rho_vs_R": {
+        "n": 1,
+        "pearson_r": null,
+        "pearson_p": null,
+        "spearman_r": null,
+        "spearman_p": null
+      }
+    },
+    "generalized": {
+      "c_vs_R": {
+        "n": 36,
+        "pearson_r": 0.7621588805845748,
+        "pearson_p": 6.64169037856679e-08,
+        "spearman_r": 0.8957528957528959,
+        "spearman_p": 1.6116539110578964e-13
+      },
+      "rho_vs_R": {
+        "n": 36,
+        "pearson_r": 0.704559742570417,
+        "pearson_p": 1.6179523838063633e-06,
+        "spearman_r": 0.8944658944658945,
+        "spearman_p": 1.9653074699307667e-13
+      }
+    },
+    "random": {
+      "c_vs_R": {
+        "n": 11,
+        "pearson_r": -0.16067882593960503,
+        "pearson_p": 0.6369578077970172,
+        "spearman_r": -0.06363636363636364,
+        "spearman_p": 0.8525390725425217
+      },
+      "rho_vs_R": {
+        "n": 11,
+        "pearson_r": -0.1911310681417328,
+        "pearson_p": 0.5734594049878994,
+        "spearman_r": -0.26363636363636367,
+        "spearman_p": 0.4334407376116145
+      }
+    },
+    "top_cap": {
+      "c_vs_R": {
+        "n": 12,
+        "pearson_r": 0.6329785895033025,
+        "pearson_p": 0.02715646516824982,
+        "spearman_r": 0.034965034965034975,
+        "spearman_p": 0.9140933424107598
+      },
+      "rho_vs_R": {
+        "n": 12,
+        "pearson_r": -0.25606098740162136,
+        "pearson_p": 0.4217888486232425,
+        "spearman_r": 0.006993006993006993,
+        "spearman_p": 0.9827917689028476
+      }
+    }
+  },
+  "by_selected_alpha": {
+    "4.0e-02": {
+      "c_vs_R": {
+        "n": 1,
+        "pearson_r": null,
+        "pearson_p": null,
+        "spearman_r": null,
+        "spearman_p": null
+      },
+      "rho_vs_R": {
+        "n": 1,
+        "pearson_r": null,
+        "pearson_p": null,
+        "spearman_r": null,
+        "spearman_p": null
+      },
+      "topk_c": {},
+      "topk_rho": {}
+    },
+    "8.0e-02": {
+      "c_vs_R": {
+        "n": 1,
+        "pearson_r": null,
+        "pearson_p": null,
+        "spearman_r": null,
+        "spearman_p": null
+      },
+      "rho_vs_R": {
+        "n": 1,
+        "pearson_r": null,
+        "pearson_p": null,
+        "spearman_r": null,
+        "spearman_p": null
+      },
+      "topk_c": {},
+      "topk_rho": {}
+    },
+    "4.0e-01": {
+      "c_vs_R": {
+        "n": 58,
+        "pearson_r": 0.063254095192585,
+        "pearson_p": 0.6371301868389898,
+        "spearman_r": 0.48217416715371136,
+        "spearman_p": 0.00012677342190912277
+      },
+      "rho_vs_R": {
+        "n": 58,
+        "pearson_r": 0.7314682368869928,
+        "pearson_p": 6.964815721950829e-11,
+        "spearman_r": 0.8615152726937156,
+        "spearman_p": 4.01418647720767e-18
+      },
+      "topk_c": {
+        "top5": 0.4,
+        "top10": 0.7,
+        "top20": 0.7
+      },
+      "topk_rho": {
+        "top5": 0.0,
+        "top10": 0.8,
+        "top20": 0.75
+      }
+    }
+  },
+  "spearman_difference_bootstrap": {
+    "n": 60,
+    "n_bootstrap": 2000,
+    "mean": 0.34276643707382637,
+    "ci95": [
+      0.18768696493839537,
+      0.5109570298315165
+    ]
+  },
+  "verdict": "rho_stronger_than_c",
+  "verdict_detail": "Spearman(rho,R)=0.8559 vs Spearman(c,R)=0.5166; stratified bootstrap CI95(delta)=[0.18768696493839537, 0.5109570298315165]"
+}
