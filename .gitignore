@@ -31,3 +31,4 @@ diagnose_kfac_eig.py
 projected_adam_factor_stats.json
 projected_adam_grad_norm_stats.json
 projected_sgd_factor_stats.json
+.vscode/
