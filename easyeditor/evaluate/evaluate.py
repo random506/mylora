@@ -7,32 +7,24 @@ from ..models.melo.melo import LORA
 
 import typing
 from itertools import chain
-from typing import List, Optional
+from typing import List
 
 import numpy as np
-import torch
-# from sklearn.feature_extraction.text import TfidfVectorizer
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer
 from ..util import HyperParams
 from .evaluate_utils import (
-    test_seq2seq_batch_prediction_acc, 
-    test_batch_prediction_acc, 
+    test_seq2seq_batch_prediction_acc,
+    test_batch_prediction_acc,
     test_prediction_acc,
     test_prediction_acc_real,
     is_probability_higher,
     test_safety_acc,
-    test_generation_quality, 
-    test_concept_gen,
-    test_safety_gen,
-    test_instance_change,
+    test_generation_quality_serac as test_generation_quality,
     PPL,
     OOD_PPL,
-    kl_loc_loss,
-    es,
-    es_per_icl,
-    per_generation,
-    F1
+    _vllm_generate,
 )
+from vllm import SamplingParams
 
 def compute_edit_quality_safety(
     model,
@@ -79,6 +71,7 @@ def compute_edit_quality(
     :param vec: ???
     :return: Dictionary containing rewriting metrics
     """
+    print("="*50,"#"*10)
     if isinstance(model,LORA):
         model=model.model
 
@@ -122,10 +115,8 @@ def compute_edit_quality(
                                             record['portability'][portability_key]['ground_truth'], device=device)
             )
     if test_generation:
-        if hparams.alg_name == 'GRACE':
-            ret['fluency'] = test_generation_quality(model=model,tok=tok,prefixes=rewrite_prompts if isinstance(rewrite_prompts,list) else [rewrite_prompts,], max_out_len=100, vanilla_generation=True)
-        else:
-            ret['fluency'] = test_generation_quality(model=model,tok=tok,prefixes=rewrite_prompts if isinstance(rewrite_prompts,list) else [rewrite_prompts,], max_out_len=100, vanilla_generation=False)
+        prefixes = rewrite_prompts if isinstance(rewrite_prompts, list) else [rewrite_prompts]
+        ret['fluency'] = test_generation_quality(model=model, tok=tok, prefixes=prefixes, max_out_len=100)
     return ret
 
 def compute_safety_rewrite_quality(
@@ -183,17 +174,13 @@ def compute_rewrite_or_rephrase_quality(
                 f"ood_acc": ans
             }
         elif hparams.alg_name=="GRACE":
-            # ppl = PPL(model, tok, prompt, target_new, device)
             if 't5' in model_name.lower():
                 acc = test_seq2seq_batch_prediction_acc(model, tok, hparams, prompt, target_new, device)
             else:
-                acc = test_prediction_acc(model, tok, hparams, prompt, target_new, device, vanilla_generation=True)
-            f1 = F1(model,tok,hparams,prompt,target_new,device, vanilla_generation=True)
+                acc = test_prediction_acc(model, tok, hparams, prompt, target_new, device)
             ret = {
                 f"{key}_acc": acc,
-                # f"{key}_PPL": ppl,
-                f"{key}_F1":f1     
-            }        
+            }
         else:
             if 't5' in model_name.lower():
                 acc = test_seq2seq_batch_prediction_acc(model, tok, hparams, prompt, target_new, device)
@@ -225,7 +212,7 @@ def compute_locality_quality(
         if 't5' in model_name.lower():
             acc = test_seq2seq_batch_prediction_acc(model, tok, hparams, prompt, locality_ground_truth, device, locality=True)
         else:
-            acc = test_prediction_acc(model, tok, hparams, prompt, locality_ground_truth, device, locality=False, vanilla_generation=hparams.alg_name=='GRACE')
+            acc = test_prediction_acc(model, tok, hparams, prompt, locality_ground_truth, device, locality=False)
 
         if type(acc) is not list:
             acc = [acc,]
@@ -261,7 +248,7 @@ def compute_locality_quality_counterfact(
 
 
 def compute_rewrite_quality_counterfact(
-    model: AutoModelForCausalLM,
+    model,
     tok: AutoTokenizer,
     record: typing.Dict,
 ) -> typing.Dict:
@@ -324,74 +311,44 @@ def compute_rewrite_quality_counterfact(
 
     return ret
 
+def _vllm_suffix_nll(model, tok, prefix: str, suffix: str) -> float:
+    full = f"{prefix} {suffix}"
+    prompt_len = len(tok.encode(prefix))
+    sp = SamplingParams(max_tokens=1, temperature=0.0, prompt_logprobs=0)
+    out = _vllm_generate(model, [full], sp)[0]
+    plp = out.prompt_logprobs
+    if plp is None:
+        return float("inf")
+    token_ids = tok.encode(full)
+    nll = 0.0
+    for i in range(prompt_len, len(token_ids)):
+        if i >= len(plp) or plp[i] is None:
+            continue
+        tid = token_ids[i]
+        if tid in plp[i]:
+            nll += -plp[i][tid].logprob
+    return nll
+
+
 def test_batch_prediction(
     model,
     tok,
     prefixes: typing.List[str],
-    which_correct: str,
+    which_correct: typing.List[int],
     target_new: str,
     target_true: str,
 ):
-    """
-    which_correct: Which target to consider correct. Either 0 for "new" or 1 for "true".
-    """
-
-    prefix_lens = [len(n) for n in tok(prefixes)["input_ids"]]
-    prompt_tok = tok(
-        [
-            f"{prefix} {suffix}"
-            for prefix in prefixes
-            for suffix in [target_new, target_true]
-        ],
-        padding=True,
-        return_tensors="pt",
-    ).to("cuda")
-
-    a_tok, b_tok = (tok(f" {n}")["input_ids"] for n in [target_new, target_true])
-
-    if 'llama' in model.config._name_or_path.lower():
-        a_tok = a_tok[1:]
-        b_tok = b_tok[1:]
-        prefix_lens = [lengths -1 for lengths in prefix_lens]
-
-    choice_a_len, choice_b_len = (len(n) for n in [a_tok, b_tok])
-    with torch.no_grad():
-        logits = model(**prompt_tok).logits
-
-    if 'llama' in model.config._name_or_path.lower():
-        logits = logits[:, 1:, :]
-
-    probs = np.zeros((logits.size(0),), dtype=np.float32)
+    probs = []
     targets_correct = []
-
-    for i in range(logits.size(0)):
-        cur_len = choice_a_len if i % 2 == 0 else choice_b_len
-
-        # Compute suffix probabilities
-        for j in range(cur_len):
-            cur_tok = (a_tok if i % 2 == 0 else b_tok)[j]
-            probs[i] += -torch.nn.functional.log_softmax(
-                logits[i, prefix_lens[i // 2] + j - 1, :], dim=0
-            )[cur_tok].item()
-        probs[i] /= cur_len
-
-        # Compute accuracy on new targets
-        if (which_correct[i // 2] == 0 and i % 2 == 0) or (
-            which_correct[i // 2] == 1 and i % 2 == 1
-        ):
-            correct = True
-            for j in range(cur_len):
-                cur_tok = (a_tok if i % 2 == 0 else b_tok)[j]
-
-                if logits[i, prefix_lens[i // 2] + j - 1, :].argmax().item() != cur_tok:
-                    correct = False
-                    break
-            targets_correct.append(correct)
-
-    return [
-        {"target_new": probs[i].item(), "target_true": probs[i + 1].item()}
-        for i in range(0, len(probs), 2)
-    ], targets_correct
+    for i, prefix in enumerate(prefixes):
+        nll_new = _vllm_suffix_nll(model, tok, prefix, target_new)
+        nll_true = _vllm_suffix_nll(model, tok, prefix, target_true)
+        probs.append({"target_new": nll_new, "target_true": nll_true})
+        if which_correct[i] == 0:
+            targets_correct.append(nll_new < nll_true)
+        else:
+            targets_correct.append(nll_true < nll_new)
+    return probs, targets_correct
 
 
 
@@ -409,7 +366,7 @@ def compute_portability_quality(
     if 't5' in model_name.lower():
         portability_correct = test_seq2seq_batch_prediction_acc(model, tok, hparams, prompt, ground_truth, device)
     else:
-        portability_correct = test_prediction_acc(model, tok, hparams, prompt, ground_truth, device, vanilla_generation=hparams.alg_name=='GRACE')
+        portability_correct = test_prediction_acc(model, tok, hparams, prompt, ground_truth, device)
 
     ret = {
         f"{portability_key}_acc": portability_correct
@@ -529,7 +486,7 @@ def compute_icl_edit_quality(
             ret['portability'][f'{portability_key}_acc'] = portability_acc
 
     if test_generation:
-        ret['fluency'] = test_generation_quality(model=model,tok=tok, prefixes=new_fact if isinstance(new_fact,list) else [new_fact,], max_out_len=100, vanilla_generation=False)
+        ret['fluency'] = test_generation_quality(model=model, tok=tok, prefixes=new_fact if isinstance(new_fact, list) else [new_fact], max_out_len=100)
     return ret
 
 def icl_lm_eval(
@@ -541,40 +498,12 @@ def icl_lm_eval(
         target,
         x,
         neighborhood=False
-)-> typing.Dict:
-    device = torch.device(f'cuda:{hparams.device}')
-    if 't5' in model_name.lower():
-        target_len = len(tokenizer.encode(target))
-        target_ids = tokenizer(f'{x} {target}', return_tensors='pt')['input_ids'].to(device)
-        encodings = tokenizer(''.join(icl_examples), return_tensors='pt')
-        input_ids = encodings['input_ids'].to(device)
-        attention_mask = encodings['attention_mask'].to(device)
-        with torch.no_grad():
-            logits = model(input_ids=input_ids, attention_mask=attention_mask, labels=target_ids).logits
-            ans = torch.argmax(logits, dim=-1)[:,-target_len:-1].squeeze()
-            target_ids = target_ids[:,-target_len:-1]
-            if neighborhood:
-                return ans.squeeze().detach().cpu().numpy().tolist()
-            return torch.mean((ans == target_ids.to(ans.device).squeeze()).float(), dim=-1).detach().cpu().numpy().tolist()
-    elif 'llama' in model_name.lower():
-        target_ids = tokenizer(target, return_tensors='pt')['input_ids'].to(device)
-        encodings = tokenizer(''.join(icl_examples) + f'{x} {target}', return_tensors='pt')
-        input_ids = encodings['input_ids'].to(device)
-        attention_mask = encodings['attention_mask'].to(device)
-        logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
-        ans = torch.argmax(logits, dim=-1)[:,-target_ids.size(1):-1].squeeze()
-        target_ids = target_ids[:,1:]
-        if neighborhood:
-            return ans.squeeze().detach().cpu().numpy().tolist()
-        return torch.mean((ans == target_ids.to(ans.device).squeeze()).float(), dim=-1).detach().cpu().numpy().tolist()
-    else:
-        target_ids = tokenizer(' ' + target + '\n', return_tensors='pt')['input_ids'].to(device)
-        encodings = tokenizer(''.join(icl_examples) + f'{x} {target}', return_tensors='pt')
-        input_ids = encodings['input_ids'].to(device)
-        attention_mask = encodings['attention_mask'].to(device)
-        logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
-        ans = torch.argmax(logits, dim=-1)[:,-target_ids.size(1):-1].squeeze()
-        target_ids = target_ids[:,:-1]
-        if neighborhood:
-            return ans.squeeze().detach().cpu().numpy().tolist()
-        return torch.mean((ans == target_ids.to(ans.device).squeeze()).float(), dim=-1).detach().cpu().numpy().tolist()
+) -> typing.Dict:
+    prefix = ''.join(icl_examples) + f'{x} '
+    target_ids = tokenizer.encode(target, add_special_tokens=False)
+    sp = SamplingParams(max_tokens=len(target_ids), temperature=0.0, top_p=1.0)
+    out_ids = list(_vllm_generate(model, [prefix], sp)[0].outputs[0].token_ids)
+    if neighborhood:
+        return out_ids
+    n = min(len(target_ids), len(out_ids))
+    return float(np.mean(np.equal(target_ids[:n], out_ids[:n]))) if n else 0.0

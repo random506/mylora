@@ -4,7 +4,7 @@ from typing import Any, Dict, List
 import torch
 from tqdm import trange
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from easyeditor.tools.tracker import ExperimentTracker
+import wandb
 from utils import chunks, save_model_and_tokenizer
 
 from easyeditor.models.crispedit.CrispEdit_hparams import CrispEditHyperParams
@@ -21,19 +21,6 @@ from easyeditor.models.crispedit.utils import (
     wrap_model_with_lora_and_return_opt,
 )
 
-from easyeditor.mymodels import (
-    CrispLoRAHyperParams,
-    MyLoRAHyperParams,
-    apply_limit_grad_lora_to_model,
-    build_lora_projection_cache,
-    attach_curvature_lora_variant,
-    apply_leaky_lora_to_model,
-    apply_lora_to_model,
-    apply_simple_finetune
-)
-from peft import LoraConfig, get_peft_model, TaskType
-
-
 def execute_ft(
     model: AutoModelForCausalLM,
     tok: AutoTokenizer,
@@ -44,14 +31,14 @@ def execute_ft(
     """
     Executes the FT update algorithm for the specified update at the specified layer
     """
-    print("进入执行函数")
     device = model.device
+    
     if tok.padding_side != "right":
         tok.padding_side = "right"
     
     requests = deepcopy(requests)
     for i, request in enumerate(requests):
-        if request["target_new"] and request["target_new"][0] != " ":
+        if request["target_new"][0] != " ":
             requests[i]["target_new"] = " " + request["target_new"]
     
     layer_to_cov_cache_old = calculate_cov_cache_with_old_data(
@@ -62,20 +49,18 @@ def execute_ft(
         model, opt = wrap_model_with_lora_and_return_opt(model, hparams)
         current_weights_cpu = None #my code gets uglier with each day
     else:
-        print("[1]\n\n\n")
         opt = build_optimizer_with_cov_caches(model, hparams, [layer_to_cov_cache_old])
-        print("[2]\n\n\n")
         weights = get_weights(model, hparams, bias=True)
         current_weights_cpu = cache_weights_to_cpu(weights)
         for name, w in model.named_parameters():
             w.requires_grad = name in weights
     
-    #old_loss = calculate_old_loss(model, tok, hparams)
-    #ExperimentTracker.log(old_loss) # fine to log even if empty, basically no-op
+    old_loss = calculate_old_loss(model, tok, hparams)
+    wandb.log(old_loss) # fine to log even if empty, basically no-op
     
     loss_meter = AverageMeter()
     pbar = trange(hparams.num_steps)
-    print("[3]\n\n\n")
+
     for it in pbar:
         loss_meter.reset()
 
@@ -88,18 +73,20 @@ def execute_ft(
             chunks(texts, hparams.batch_size), chunks(targets, hparams.batch_size)
         ):
             inputs_targets = [txt_ + tgt_ for txt_, tgt_ in zip(txt, tgt)]
-            encodings = tok(inputs_targets, return_tensors="pt", padding=True, truncation=True, max_length=hparams.max_length).to(device)
+            encodings = tok(inputs_targets, return_tensors="pt", padding=True).to(device)
+
             labels = encodings["input_ids"].clone()
 
             labels[labels == tok.pad_token_id] = -100
             for i, prompt in enumerate(txt):
-                prompt_len = len(tok(prompt, add_special_tokens=True, truncation=True, max_length=hparams.max_length)["input_ids"])
+                prompt_len = len(tok(prompt, add_special_tokens=True)["input_ids"])
                 labels[i, :prompt_len] = -100
             opt.zero_grad(set_to_none=True)
             outputs = model(**encodings, labels=labels)
             loss = outputs.loss
                 
             loss_meter.update(loss.item(), n=labels.size(0))
+            
             if loss.item() >= 1e-2:
                 loss.backward()
                 opt.step()
@@ -112,22 +99,17 @@ def execute_ft(
                 )
                 if should_recalculate:
                     opt = build_optimizer_with_cov_caches(model, hparams, [layer_to_cov_cache_old], opt=opt)
-        #metrics = calculate_old_loss(model, tok, hparams)
-        #metrics.update({f"FT Loss": loss_meter.avg})
-        #ExperimentTracker.log(metrics) # fine to log even if empty, basically no-op
 
-        metrics = {"FT Loss": loss_meter.avg}
-        ExperimentTracker.log(metrics) # fine to log even if empty, basically no-op
-        pbar.write(f"FT Loss: {loss_meter.avg:.4f}")
+        metrics = calculate_old_loss(model, tok, hparams)
+        metrics.update({f"FT Loss": loss_meter.avg})
+        wandb.log(metrics) # fine to log even if empty, basically no-op
         
         pbar.set_postfix({"loss": f"{loss_meter.avg:.4f}"})
-
         if loss_meter.avg < 1e-2:
             break
     
     if hparams.perform_lora:
         model = model.merge_and_unload()
-    
     return model
 
 def execute_ft_sequential(
@@ -140,7 +122,6 @@ def execute_ft_sequential(
     """
     Executes the FT update algorithm for the specified update at the specified layer
     """
-    tracker = kwargs.get("tracker", None)
     device = model.device
     
     if tok.padding_side != "right":
@@ -148,7 +129,7 @@ def execute_ft_sequential(
     
     requests = deepcopy(requests)
     for i, request in enumerate(requests):
-        if request["target_new"] and request["target_new"][0] != " ":
+        if request["target_new"][0] != " ":
             requests[i]["target_new"] = " " + request["target_new"]
     random.shuffle(requests)
     texts = [r["prompt"] for r in requests]
@@ -173,7 +154,7 @@ def execute_ft_sequential(
             w.requires_grad = name in weights
 
     old_loss = calculate_old_loss(model, tok, hparams)
-    tracker.log(old_loss) # fine to log even if empty, basically no-op
+    wandb.log(old_loss) # fine to log even if empty, basically no-op
     
     layer_to_cov_cache_data = None
     loss_meter = AverageMeter()
@@ -189,13 +170,13 @@ def execute_ft_sequential(
                 chunks(txt_edit, hparams.batch_size), chunks(tgt_edit, hparams.batch_size)
             ):
                 inputs_targets = [txt_ + tgt_ for txt_, tgt_ in zip(txt, tgt)]
-                encodings = tok(inputs_targets, return_tensors="pt", padding=True, truncation=True, max_length=hparams.max_length).to(device)
+                encodings = tok(inputs_targets, return_tensors="pt", padding=True).to(device)
 
                 labels = encodings["input_ids"].clone()
 
                 labels[labels == tok.pad_token_id] = -100
                 for i, prompt in enumerate(txt):
-                    prompt_len = len(tok(prompt, add_special_tokens=True, truncation=True, max_length=hparams.max_length)["input_ids"])
+                    prompt_len = len(tok(prompt, add_special_tokens=True)["input_ids"])
                     labels[i, :prompt_len] = -100
                 opt.zero_grad()
                 outputs = model(**encodings, labels=labels)
@@ -266,7 +247,7 @@ def execute_ft_sequential(
         metrics = calculate_old_loss(model, tok, hparams)
         old_edit_loss = calculate_old_edit_loss(txt_chunks, tgt_chunks, model, tok)
         metrics.update(old_edit_loss)
-        tracker.log(metrics) # fine to log even if empty, basically no-op
+        wandb.log(metrics) # fine to log even if empty, basically no-op
 
     if hparams.perform_lora:
         model = model.merge_and_unload()
@@ -371,457 +352,3 @@ def inspect_model_structure(model):
     print(f"Total Buffers:       {buffer_count}")
     print(f"Approx Model Size:   {total_memory_bytes / (1024**2):.2f} MB")
     print("=" * 100)
-
-
-def execute_ft_grad_lora(
-    model: AutoModelForCausalLM,
-    tok: AutoTokenizer,
-    requests: List[Dict],
-    hparams: MyLoRAHyperParams,
-    **kwargs: Any,
-) -> AutoModelForCausalLM:
-    # 对于梯度进行投影
-    print("[2]进入execute_ft_grad_lora函数中......")
-    return apply_limit_grad_lora_to_model(model,tok,requests,hparams)
-    
-    '''
-    device = model.device
-
-    if tok.padding_side != "right":
-        tok.padding_side = "right"
-
-    requests = deepcopy(requests)
-    for i, request in enumerate(requests):
-        if request["target_new"] and request["target_new"][0] != " ":
-            requests[i]["target_new"] = " " + request["target_new"]
-
-
-    # 方法一核心
-    peft_model, opt, layer_to_proj_cache = wrap_model_and_build_projected_optimizer(
-        model, tok, hparams
-    )
-
-    if not getattr(hparams, "disable_old_loss_check", False):
-        old_loss = calculate_old_loss(peft_model, tok, hparams)
-        tracker.log(old_loss)
-
-    loss_meter = AverageMeter()
-    pbar = trange(hparams.num_steps)
-
-    for it in pbar:
-        loss_meter.reset()
-
-        random.shuffle(requests)
-        texts = [r["prompt"] for r in requests]
-        targets = [r["target_new"] for r in requests]
-
-        for txt, tgt in zip(
-            chunks(texts, hparams.batch_size), chunks(targets, hparams.batch_size)
-        ):
-            inputs_targets = [txt_ + tgt_ for txt_, tgt_ in zip(txt, tgt)]
-            encodings = tok(inputs_targets, return_tensors="pt", padding=True, truncation=True, max_length=hparams.max_length).to(device)
-
-            labels = encodings["input_ids"].clone()
-
-            labels[labels == tok.pad_token_id] = -100
-            for i, prompt in enumerate(txt):
-                prompt_len = len(tok(prompt, add_special_tokens=True, truncation=True, max_length=hparams.max_length)["input_ids"])
-                labels[i, :prompt_len] = -100
-
-            opt.zero_grad(set_to_none=True)
-            outputs = peft_model(**encodings, labels=labels)
-            loss = outputs.loss
-
-            loss_meter.update(loss.item(), n=labels.size(0))
-
-            if loss.item() >= 1e-2:
-                loss.backward()
-                opt.step()
-
-        if not getattr(hparams, "disable_old_loss_check", False):
-            metrics = calculate_old_loss(peft_model, tok, hparams)
-            metrics.update({"FT LoRA Loss": loss_meter.avg})
-            tracker.log(metrics)
-        else:
-            tracker.log({"FT LoRA Loss": loss_meter.avg})
-
-        pbar.set_postfix({"loss": f"{loss_meter.avg:.4f}"})
-        if loss_meter.avg < 1e-2:
-            break
-
-    # 将 LoRA 适配器权重合并回原始模型权重，
-    # 移除适配器结构，返回标准的 AutoModelForCausalLM。
-    merged_model = peft_model.merge_and_unload()
-    return merged_model
-    '''
-
-def execute_ft_param_lora(
-    model: AutoModelForCausalLM,
-    tok: AutoTokenizer,
-    requests: List[Dict],
-    hparams: CrispLoRAHyperParams,
-    **kwargs: Any,
-) -> AutoModelForCausalLM:
-    tracker = kwargs.get("tracker", None)
-    device = model.device
-
-    # 确保 padding 在右侧，与自回归 loss 掩码逻辑一致
-    if tok.padding_side != "right":
-        tok.padding_side = "right"
-
-    # 深拷贝请求列表，避免修改原始数据；
-    # 确保 target_new 以空格开头（与 tokenizer 的 BOS 处理方式对齐）
-    requests = deepcopy(requests)
-    for i, request in enumerate(requests):
-        if request["target_new"] and request["target_new"][0] != " ":
-            requests[i]["target_new"] = " " + request["target_new"]
-
-    layer_to_cov_cache_old = build_lora_projection_cache(model, tok, hparams)
-
-    model.config.use_cache = False       # 关闭 KV cache，允许梯度回传
-    model.enable_input_require_grads()   # 确保输入 embedding 支持梯度
-
-    peft_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        inference_mode=False,
-        r=hparams.lora_rank,                                              # LoRA 秩
-        lora_alpha=hparams.lora_alpha,                                    # 缩放系数
-        lora_dropout=hparams.lora_dropout,                                # Dropout 概率
-        layers_to_transform=hparams.layers if len(hparams.layers) > 0 else None,  # 限制变换层
-        target_modules=hparams.target_modules,                            # 目标模块名（如 q_proj, v_proj）
-    )
-
-    peft_model = get_peft_model(model, peft_config)
-    peft_model.print_trainable_parameters()  # 打印可训练参数量，便于调试
-
-    adapter_name = "default"
-
-    attach_curvature_lora_variant(peft_model, adapter_name=adapter_name)
-
-    for name, module in peft_model.named_modules():
-        # 仅处理同时具备 lora_A/lora_B 且已被升级为 CurvatureLora 的模块
-        if not (
-            hasattr(module, "lora_A")
-            and hasattr(module, "lora_B")
-            and hasattr(module, "in_features")
-            and hasattr(module, "out_features")
-        ):
-            continue
-        if adapter_name not in getattr(module, "lora_variant", {}):
-            continue
-
-        # 在缓存字典中查找与当前模块名最匹配的层
-        matched_cache = None
-        for layer_name, cache in layer_to_cov_cache_old.items():
-            # 去掉尾部 ".weight" 后缀再做子串匹配
-            clean = layer_name[: -len(".weight")] if layer_name.endswith(".weight") else layer_name
-            if clean in name:
-                matched_cache = cache
-                break
-
-        if matched_cache is None:
-            continue  # 该模块无对应缓存，跳过（保持普通 LoRA 行为）
-
-        # 提取基础权重的设备和数据类型，保证后续张量一致
-        base_weight = module.base_layer.weight if hasattr(module, "base_layer") else module.weight
-        dev = base_weight.device
-        dtype = base_weight.dtype
-
-        # Ua/Ub 的列按特征值升序排列；
-        # mask==True  → 低能量（低曲率，安全方向）
-        # mask==False → 高能量（高曲率，危险方向），即我们要避开的方向
-        Ua = matched_cache["Ua"].to(device=dev, dtype=dtype)  # (d_in,  d_in)
-        Ub = matched_cache["Ub"].to(device=dev, dtype=dtype)  # (d_out, d_out)
-        mask_a = matched_cache["mask_a"].to(device=dev)       # BoolTensor，True=低曲率
-        mask_b = matched_cache["mask_b"].to(device=dev)
-
-        # 提取高曲率方向（~mask = False 列）
-        U_in_bar  = Ua[:, ~mask_a]   # (d_in,  k_in)  —— 输入高曲率基
-        U_out_bar = Ub[:, ~mask_b]   # (d_out, k_out) —— 输出高曲率基
-
-        # 将基向量作为属性注入模块，CurvatureLora.forward 在运行时读取
-        setattr(module, f"U_in_bar_{adapter_name}",  U_in_bar)
-        setattr(module, f"U_out_bar_{adapter_name}", U_out_bar)
-
-    opt = torch.optim.Adam(
-        [p for p in peft_model.parameters() if p.requires_grad],
-        lr=hparams.lr,
-        weight_decay=hparams.weight_decay,
-    )
-
-    # 记录训练前的旧数据 loss 作为基线
-    if not getattr(hparams, "disable_old_loss_check", False):
-        old_loss = calculate_old_loss(peft_model, tok, hparams)
-        tracker.log(old_loss)
-
-    loss_meter = AverageMeter()
-    pbar = trange(hparams.num_steps)
-
-    for it in pbar:
-        loss_meter.reset()
-
-        # 每轮随机打乱，减少顺序偏差
-        random.shuffle(requests)
-        texts   = [r["prompt"]     for r in requests]
-        targets = [r["target_new"] for r in requests]
-
-        for txt, tgt in zip(
-            chunks(texts,   hparams.batch_size),
-            chunks(targets, hparams.batch_size),
-        ):
-            # 拼接 prompt + target，形成完整的训练序列
-            inputs_targets = [txt_ + tgt_ for txt_, tgt_ in zip(txt, tgt)]
-            encodings = tok(
-                inputs_targets,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=hparams.max_length,
-            ).to(device)
-
-            # 构造 labels：只在 target_new 对应 token 位置计算 loss
-            labels = encodings["input_ids"].clone()
-            labels[labels == tok.pad_token_id] = -100   # 忽略 padding
-            for i, prompt in enumerate(txt):
-                # 获取 prompt 部分的 token 长度，将其对应位置置 -100
-                prompt_len = len(
-                    tok(
-                        prompt,
-                        add_special_tokens=True,
-                        truncation=True,
-                        max_length=hparams.max_length,
-                    )["input_ids"]
-                )
-                labels[i, :prompt_len] = -100  # 忽略 prompt token 的 loss
-
-            opt.zero_grad(set_to_none=True)
-            outputs = peft_model(**encodings, labels=labels)
-            loss = outputs.loss
-
-            loss_meter.update(loss.item(), n=labels.size(0))
-
-            # loss 过小时跳过更新，避免无意义的微小梯度扰动
-            if loss.item() >= 1e-2:
-                loss.backward()
-                opt.step()
-
-        # 记录当前轮次的旧数据 loss 和编辑 loss
-        if not getattr(hparams, "disable_old_loss_check", False):
-            metrics = calculate_old_loss(peft_model, tok, hparams)
-            metrics.update({"FT ParamLoRA Loss": loss_meter.avg})
-            tracker.log(metrics)
-        else:
-            tracker.log({"FT ParamLoRA Loss": loss_meter.avg})
-
-        pbar.set_postfix({"loss": f"{loss_meter.avg:.4f}"})
-        # 收敛提前停止
-        if loss_meter.avg < 1e-2:
-            break
-
-    merged_model = peft_model.merge_and_unload()
-    return merged_model  
-
-def execute_ft_both_lora(
-    model: AutoModelForCausalLM,
-    tok: AutoTokenizer,
-    requests: List[Dict],
-    hparams: CrispLoRAHyperParams,
-    **kwargs: Any,
-) -> AutoModelForCausalLM:
-    print("进入第一层函数 ......")
-    tracker = kwargs.get("tracker", None)
-    return apply_leaky_lora_to_model(model, tok, requests, hparams,tracker = tracker)
-'''
-    调用示例
-    --------
-    from easyeditor.mymodels.crispedit_param import (
-        CrispEditParamHyperParams,
-        execute_crispedit_param,
-    )
-
-    hparams = CrispEditParamHyperParams.from_hparams("hparams/CRISPEDIT_PARAM/llama3-8b.yaml")
-    requests = [{"prompt": "The capital of France is", "target_new": " Paris"}]
-    model = execute_crispedit_param(model, tok, requests, hparams)
-'''
-
-
-def execute_ft_lora(
-    model: AutoModelForCausalLM,
-    tok: AutoTokenizer,
-    requests: List[Dict],
-    hparams: CrispLoRAHyperParams,
-    **kwargs: Any,
-) -> AutoModelForCausalLM:
-    print("进入第一层函数 ......")
-    tracker = kwargs.get("tracker", None)
-    return apply_lora_to_model(model, tok, requests, hparams,tracker = tracker)
-
-
-def execute_finetune(
-    model: AutoModelForCausalLM,
-    tok: AutoTokenizer,
-    requests: List[Dict],
-    hparams: CrispLoRAHyperParams,
-    **kwargs: Any,
-) -> AutoModelForCausalLM:
-    print("进入execute_finetune函数 ......")
-    return apply_simple_finetune(model, tok, requests, hparams)
-
-
-def execute_ft_pro(
-    model,
-    tok,
-    requests: List[Dict],
-    hparams,
-    **kwargs,
-):
-    """改进版 execute_ft：集成 KL 散度正则 + 闭式残差修正。
-
-    相比原始 execute_ft 的改进：
-    1. 训练前初始化 KL 锚点正则化器，记录原始输出分布
-    2. 每步训练加入 KL 锚点损失，防止输出分布漂移
-    3. 迭代收敛后执行闭式残差修正，补齐编辑残差
-
-    参数:
-        model: 模型
-        tok: tokenizer
-        requests: 编辑请求列表
-        hparams: 超参数（额外支持 kl_factor, nullspace_threshold, L2 等）
-
-    返回:
-        model: 编辑后的模型
-    """
-    from easyeditor.models.crispedit.projected_adam import KLDivergenceRegularizer,precompute_null_space_projections,closed_form_residual_correction
-
-    print("[execute_ft_pro] 进入改进版执行函数")
-    device = model.device
-    if tok.padding_side != "right":
-        tok.padding_side = "right"
-
-    requests = deepcopy(requests)
-    for i, request in enumerate(requests):
-        if request["target_new"] and request["target_new"][0] != " ":
-            requests[i]["target_new"] = " " + request["target_new"]
-
-    # === 计算协方差缓存 ===
-    layer_to_cov_cache_old = calculate_cov_cache_with_old_data(
-        model, tok, hparams, force_recompute=False
-    )
-
-    opt = build_optimizer_with_cov_caches(model, hparams, [layer_to_cov_cache_old])
-    weights = get_weights(model, hparams, bias=True)
-    current_weights_cpu = cache_weights_to_cpu(weights)
-    for name, w in model.named_parameters():
-        w.requires_grad = name in weights
-
-    # === 改进 1：初始化 KL 锚点正则化器 ===
-    kl_factor = getattr(hparams, "kl_factor", 0.01)
-    kl_reg = KLDivergenceRegularizer(
-        model, tok,
-        anchor_texts=None,  # 使用默认锚点
-        max_length=hparams.max_length,
-        device=device,
-    )
-    print(f"[execute_ft_pro] KL 正则系数: {kl_factor}")
-
-    # === 改进 2：预计算零空间投影矩阵 P ===
-    nullspace_threshold = getattr(hparams, "nullspace_threshold", 2e-2)
-    P_list = precompute_null_space_projections(
-        model, tok, hparams,
-        cov_cache=layer_to_cov_cache_old,
-        nullspace_threshold=nullspace_threshold,
-    )
-
-    # 初始化 cache_c（用于连续编辑的键累积）
-    cache_c = [None] * len(hparams.layers)
-
-    # === 训练循环 ===
-    loss_meter = _AverageMeter()
-    pbar = trange(hparams.num_steps)
-    kl_interval = getattr(hparams, "kl_interval", 1)  # 每隔几步计算一次 KL
-
-    for it in pbar:
-        loss_meter.reset()
-        random.shuffle(requests)
-        texts = [r["prompt"] for r in requests]
-        targets = [r["target_new"] for r in requests]
-
-        for txt, tgt in zip(
-            chunks(texts, hparams.batch_size), chunks(targets, hparams.batch_size)
-        ):
-            inputs_targets = [txt_ + tgt_ for txt_, tgt_ in zip(txt, tgt)]
-            encodings = tok(
-                inputs_targets, return_tensors="pt", padding=True,
-                truncation=True, max_length=hparams.max_length,
-            ).to(device)
-            labels = encodings["input_ids"].clone()
-            labels[labels == tok.pad_token_id] = -100
-            for i_p, prompt in enumerate(txt):
-                prompt_len = len(
-                    tok(prompt, add_special_tokens=True, truncation=True,
-                        max_length=hparams.max_length)["input_ids"]
-                )
-                labels[i_p, :prompt_len] = -100
-
-            opt.zero_grad(set_to_none=True)
-            outputs = model(**encodings, labels=labels)
-            edit_loss = outputs.loss
-
-            # 改进 1：加入 KL 锚点损失（仅前半段训练启用，后半段关闭让编辑自由收敛）
-            kl_active_steps = hparams.num_steps // 2
-            if kl_factor > 0 and it < kl_active_steps and it % kl_interval == 0:
-                kl_loss = kl_reg.compute_loss(model)
-                total_loss = edit_loss + kl_factor * kl_loss
-            else:
-                total_loss = edit_loss
-                kl_loss = torch.tensor(0.0, device=device)
-
-            loss_meter.update(edit_loss.item(), n=labels.size(0))
-
-            # 收敛阈值仅看 edit_loss，不受 KL 残留影响
-            if edit_loss.item() >= 1e-2:
-                total_loss.backward()
-                opt.step()
-                current_weights_cpu, layer_to_cov_cache_old, should_recalculate = \
-                    recalculate_cov_cache_if_weights_changed(
-                        model, tok, hparams, current_weights_cpu, layer_to_cov_cache_old,
-                    )
-                if should_recalculate:
-                    opt = build_optimizer_with_cov_caches(
-                        model, hparams, [layer_to_cov_cache_old], opt=opt
-                    )
-
-        metrics = {"FT Loss": loss_meter.avg, "KL Loss": kl_loss.item()}
-        pbar.write(f"Step {it}: FT Loss={loss_meter.avg:.4f}, KL Loss={kl_loss.item():.4f}")
-        pbar.set_postfix({"loss": f"{loss_meter.avg:.4f}", "kl": f"{kl_loss.item():.4f}"})
-
-        if loss_meter.avg < 1e-2:
-            break
-
-    # === 改进 2：闭式残差修正 ===
-    L2 = getattr(hparams, "L2", 1.0)
-    model = closed_form_residual_correction(
-        model, tok, requests, hparams, P_list, cache_c=cache_c, L2=L2
-    )
-
-    print("[execute_ft_pro] 编辑完成")
-    return model
-
-
-class _AverageMeter:
-    """ Computes and stores the average and current value """
-
-    def __init__(self):
-        self.reset()
-
-    def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
-
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count

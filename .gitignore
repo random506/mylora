@@ -4,6 +4,7 @@ __pycache__
 run_me.sh
 .env
 logs/
+logs.bak/
 toy_experiment/data/
 toy_experiment/model_cache/
 toy_experiment/plots/
@@ -32,3 +33,4 @@ projected_adam_factor_stats.json
 projected_adam_grad_norm_stats.json
 projected_sgd_factor_stats.json
 .vscode/
+
