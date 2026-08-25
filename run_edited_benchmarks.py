@@ -12,8 +12,8 @@ from easyeditor.editors.utils import summary_metrics
 from transformers import AutoTokenizer
 from vllm import LLM
 import numpy as np
-from easyeditor.evaluate.evaluate_vllm import compute_edit_quality, compute_edit_quality_safety
-from easyeditor.evaluate.evaluate_utils_vllm import resolve_pending_llm_judges
+from easyeditor.evaluate.evaluate import compute_edit_quality, compute_edit_quality_safety
+from easyeditor.evaluate.evaluate_utils import resolve_pending_llm_judges
 import random
 import torch
 from tqdm import tqdm

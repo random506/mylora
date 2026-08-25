@@ -12,10 +12,13 @@ import os
 import threading
 import httpx
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dotenv import load_dotenv
 from openai import OpenAI
 from openai import APITimeoutError, APIConnectionError, RateLimitError, APIStatusError
 from vllm import SamplingParams
 from sklearn.metrics import f1_score
+
+load_dotenv()
 
 # ---------------------------------------------------------------------------
 # OpenAI client (for LLM-as-a-Judge)
@@ -24,18 +27,31 @@ _OAI_CLIENT = None
 _OAI_LOCK = threading.Lock()
 
 
-def _build_oai_client(api_key: str) -> OpenAI:
-    key = api_key or os.getenv("API_KEY")
-    if not key:
-        raise RuntimeError("No API key provided.")
+def _llm_judge_env(api_key: str = None):
+    key = os.getenv("API_KEY") or api_key
+    base_url = os.getenv("BASE_URL")
+    model = os.getenv("MODEL")
+    missing = [name for name, value in (("API_KEY", key), ("BASE_URL", base_url), ("MODEL", model)) if not value]
+    if missing:
+        raise RuntimeError(f"Missing .env values: {', '.join(missing)}")
+    return key, base_url, model
+
+
+def _build_oai_client(api_key: str = None) -> OpenAI:
+    key, base_url, _ = _llm_judge_env(api_key)
     timeout = httpx.Timeout(connect=10.0, read=60.0, write=60.0, pool=10.0)
     limits = httpx.Limits(max_connections=20, max_keepalive_connections=10)
     return OpenAI(
-        base_url="https://api.deepseek.com",
+        base_url=base_url,
         api_key=key,
         http_client=httpx.Client(timeout=timeout, limits=limits),
         max_retries=0,
     )
+
+
+def _get_judge_model() -> str:
+    _, _, model = _llm_judge_env()
+    return model
 
 
 def _reset_oai_client():
@@ -217,32 +233,32 @@ Just return the letters "A" or "B", with no text around it.
     for attempt in range(1, max_attempts + 1):
         try:
             completion = client.chat.completions.create(
-                model="deepseek-v4-flash",
+                model=_get_judge_model(),
                 messages=[{"role": "system", "content": ""}, {"role": "user", "content": content}],
                 temperature=0.0,
                 timeout=60.0,
                 extra_body={"thinking": {"type": "disabled"}}
             )
             llm_ans = completion.choices[0].message.content
-            print(f"大模型的返回是：{llm_ans}")
+            print(f"LLM response: {llm_ans}")
             time.sleep(0.05)
             return 1.0 if llm_ans == "A" else 0.0
         except (APITimeoutError, APIConnectionError, httpx.TimeoutException, httpx.ConnectError,
                 RateLimitError, APIStatusError) as e:
             wait = min(2 ** attempt, 60)
-            print(f"[llm_judge] 远程访问错误 (attempt {attempt}/{max_attempts}): {e}. 等待 {wait}s 后重连...")
+            print(f"[llm_judge] remote access error (attempt {attempt}/{max_attempts}): {e}. retrying in {wait}s...")
             if attempt < max_attempts:
                 time.sleep(wait)
                 continue
-            print("[llm_judge] 达到最大重试次数，返回默认分数 0.0")
+            print("[llm_judge] max retries reached, returning default score 0.0")
             return 0.0
         except Exception as e:
             wait = min(2 ** attempt, 60)
-            print(f"[llm_judge] 未知错误 (attempt {attempt}/{max_attempts}): {e}. 等待 {wait}s 后重试...")
+            print(f"[llm_judge] unexpected error (attempt {attempt}/{max_attempts}): {e}. retrying in {wait}s...")
             if attempt < max_attempts:
                 time.sleep(wait)
                 continue
-            print("[llm_judge] 达到最大重试次数，返回默认分数 0.0")
+            print("[llm_judge] max retries reached, returning default score 0.0")
             return 0.0
 
 
@@ -298,7 +314,7 @@ Just return the letters "A" or "B", with no text around it.
     for attempt in range(1, max_attempts + 1):
         try:
             completion = client.chat.completions.create(
-                model="deepseek-v4-flash",
+                model=_get_judge_model(),
                 messages=[{"role": "system", "content": ""}, {"role": "user", "content": content}],
                 temperature=0.0,
                 timeout=60.0,
@@ -309,19 +325,19 @@ Just return the letters "A" or "B", with no text around it.
         except (APITimeoutError, APIConnectionError, httpx.TimeoutException, httpx.ConnectError,
                 RateLimitError, APIStatusError) as e:
             wait = min(2 ** attempt, 60)
-            print(f"[llm_judge_safety] 远程访问错误 (attempt {attempt}/{max_attempts}): {e}. 等待 {wait}s 后重连...")
+            print(f"[llm_judge_safety] remote access error (attempt {attempt}/{max_attempts}): {e}. retrying in {wait}s...")
             if attempt < max_attempts:
                 time.sleep(wait)
                 continue
-            print("[llm_judge_safety] 达到最大重试次数，返回默认分数 0.0")
+            print("[llm_judge_safety] max retries reached, returning default score 0.0")
             return 0.0
         except Exception as e:
             wait = min(2 ** attempt, 60)
-            print(f"[llm_judge_safety] 未知错误 (attempt {attempt}/{max_attempts}): {e}. 等待 {wait}s 后重试...")
+            print(f"[llm_judge_safety] unexpected error (attempt {attempt}/{max_attempts}): {e}. retrying in {wait}s...")
             if attempt < max_attempts:
                 time.sleep(wait)
                 continue
-            print("[llm_judge_safety] 达到最大重试次数，返回默认分数 0.0")
+            print("[llm_judge_safety] max retries reached, returning default score 0.0")
             return 0.0
 
 
