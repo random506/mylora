@@ -228,7 +228,7 @@ def calculate_old_loss(model, tok, hparams):
             hparams.mom2_dataset,
             sample_size=100,
         )
-    return {"Task 1 Loss": old_task_loss}
+    return {"General capabilities of the model Loss": old_task_loss}
 
 
 def calculate_old_edit_loss(txt_chunks, tgt_chunks, model, tok):
@@ -288,12 +288,12 @@ def build_optimizer_with_cov_caches(
         soft_lambda=getattr(
             hparams,
             "soft_lambda",
-            getattr(hparams, "newton_lambda", getattr(hparams, "lambda_soft", 1.0)),
+            1.0,
         ),
         factor_damping=getattr(
             hparams,
             "factor_damping",
-            getattr(hparams, "newton_damping", 1e-3),
+            1e-5,
         ),
         lr=hparams.lr,
         weight_decay=hparams.weight_decay,
@@ -511,7 +511,7 @@ def execute_sft_adam(
     """
     Executes the FT update algorithm for the specified update at the specified layer
     """
-    print("进入执行函数")
+    print("[execute_sft_adam]Enter the function")
     device = model.device
     if tok.padding_side != "right":
         tok.padding_side = "right"
@@ -529,20 +529,17 @@ def execute_sft_adam(
         model, opt = wrap_model_with_lora_and_return_opt(model, hparams)
         current_weights_cpu = None #my code gets uglier with each day
     else:
-        print("[1]\n\n\n")
         opt = build_optimizer_with_cov_caches(model, hparams, [layer_to_cov_cache_old])
-        print("[2]\n\n\n")
         weights = get_weights(model, hparams, bias=True)
         current_weights_cpu = cache_weights_to_cpu(weights)
         for name, w in model.named_parameters():
             w.requires_grad = name in weights
-    
-    #old_loss = calculate_old_loss(model, tok, hparams)
-    #ExperimentTracker.log(old_loss) # fine to log even if empty, basically no-op
-    
+    # 加快训练，省略old_loss计算
+    old_loss = calculate_old_loss(model, tok, hparams)
+    ExperimentTracker.log(old_loss) # fine to log even if empty, basically no-op
     loss_meter = AverageMeter()
     pbar = trange(hparams.num_steps)
-    print("[3]\n\n\n")
+    print("[execute_sft_adam]Start training\n")
     for it in pbar:
         loss_meter.reset()
 
@@ -579,14 +576,13 @@ def execute_sft_adam(
                 )
                 if should_recalculate:
                     opt = build_optimizer_with_cov_caches(model, hparams, [layer_to_cov_cache_old], opt=opt)
-        #metrics = calculate_old_loss(model, tok, hparams)
-        #metrics.update({f"FT Loss": loss_meter.avg})
-        #ExperimentTracker.log(metrics) # fine to log even if empty, basically no-op
-
-        metrics = {"FT Loss": loss_meter.avg}
+        # 加快训练，省略old_loss计算
+        metrics =calculate_old_loss(model, tok, hparams)
+        metrics.update({"FT Loss": loss_meter.avg})
+        #metrics = {"FT Loss": loss_meter.avg}
         ExperimentTracker.log(metrics) # fine to log even if empty, basically no-op
-        pbar.write(f"FT Loss: {loss_meter.avg:.4f}")
         
+        pbar.write(f"FT Loss: {loss_meter.avg:.4f}")
         pbar.set_postfix({"loss": f"{loss_meter.avg:.4f}"})
 
         if loss_meter.avg < 1e-2:
@@ -595,4 +591,145 @@ def execute_sft_adam(
     if hparams.perform_lora:
         model = model.merge_and_unload()
     
+    return model
+
+def execute_sft_adam_sequential(
+    model: AutoModelForCausalLM,
+    tok: AutoTokenizer,
+    requests: List[Dict],
+    hparams: AdamHyperParams,
+    **kwargs: Any,
+    ) -> AutoModelForCausalLM:
+    """
+    Executes the FT update algorithm for the specified update at the specified layer
+    """
+    device = model.device
+    
+    if tok.padding_side != "right":
+        tok.padding_side = "right"
+    
+    requests = deepcopy(requests)
+    for i, request in enumerate(requests):
+        if request["target_new"][0] != " ":
+            requests[i]["target_new"] = " " + request["target_new"]
+    random.shuffle(requests)
+    texts = [r["prompt"] for r in requests]
+    targets = [r["target_new"] for r in requests]
+    txt_chunks, tgt_chunks = [], []
+
+
+    layer_to_cov_cache_old = calculate_cov_cache_with_old_data(
+        model, tok, hparams, force_recompute=False
+    )
+
+    
+    if hparams.perform_lora:
+        model, opt = wrap_model_with_lora_and_return_opt(model, hparams)
+        current_weights_cpu = None #my code gets uglier with each day
+    else:
+        opt = build_optimizer_with_cov_caches(model, hparams, [layer_to_cov_cache_old])
+        weights = get_weights(model, hparams, bias=True)
+        current_weights_cpu = cache_weights_to_cpu(weights)
+        
+        for name, w in model.named_parameters():
+            w.requires_grad = name in weights
+
+    old_loss = calculate_old_loss(model, tok, hparams)
+    wandb.log(old_loss) # fine to log even if empty, basically no-op
+    
+    layer_to_cov_cache_data = None
+    loss_meter = AverageMeter()
+
+    # split into batches
+    for txt_edit, tgt_edit in zip(
+        chunks(texts, hparams.num_edits), chunks(targets, hparams.num_edits)
+    ):
+        pbar = trange(hparams.num_steps)
+        for it in pbar:
+            loss_meter.reset()
+            for txt, tgt in zip(
+                chunks(txt_edit, hparams.batch_size), chunks(tgt_edit, hparams.batch_size)
+            ):
+                inputs_targets = [txt_ + tgt_ for txt_, tgt_ in zip(txt, tgt)]
+                encodings = tok(inputs_targets, return_tensors="pt", padding=True).to(device)
+
+                labels = encodings["input_ids"].clone()
+
+                labels[labels == tok.pad_token_id] = -100
+                for i, prompt in enumerate(txt):
+                    prompt_len = len(tok(prompt, add_special_tokens=True)["input_ids"])
+                    labels[i, :prompt_len] = -100
+                opt.zero_grad()
+                outputs = model(**encodings, labels=labels)
+                loss = outputs.loss
+
+                if loss.item() >= 1e-2:
+                    loss.backward()
+                    opt.step()
+                    current_weights_cpu, layer_to_cov_cache_old, should_recalculate = recalculate_cov_cache_if_weights_changed(
+                        model,
+                        tok,
+                        hparams,
+                        current_weights_cpu,
+                        layer_to_cov_cache_old,
+                    )
+                    if should_recalculate:                            
+                        if hparams.edit_n_samples > 0 and len(txt_chunks) > 0:
+                            old_txt_list = [item for sublist in txt_chunks for item in sublist]
+                            old_tgt_list = [item for sublist in tgt_chunks for item in sublist]
+
+                            layer_to_cov_cache_data = calculate_cov_cache_with_request(
+                                old_txt_list,
+                                old_tgt_list,
+                                model,
+                                tok,
+                                hparams,
+                            )
+                            opt = build_optimizer_with_cov_caches(model, hparams, [layer_to_cov_cache_old, layer_to_cov_cache_data], opt=opt)
+                        else:
+                            opt = build_optimizer_with_cov_caches(model, hparams, [layer_to_cov_cache_old] if layer_to_cov_cache_data is None else [layer_to_cov_cache_old, layer_to_cov_cache_data], opt=opt)
+                loss_meter.update(loss.item(), n=labels.size(0))
+            pbar.set_postfix({"loss": f"{loss_meter.avg:.4f}"})
+            if loss_meter.avg < 1e-2:
+                break
+        print(f"Loss after editing number of samples {len(txt_edit)}: {loss_meter.avg}")
+        
+        txt_chunks.append(txt_edit)
+        tgt_chunks.append(tgt_edit)
+        
+        if hparams.edit_cache_style == 'sequential':
+            layer_to_cov_cache_data_new = calculate_cov_cache_with_request(
+                txt_edit,
+                tgt_edit,
+                model,
+                tok,
+                hparams,
+            )
+            if layer_to_cov_cache_data is None:
+                layer_to_cov_cache_data = layer_to_cov_cache_data_new
+            else:
+                layer_to_cov_cache_data = combine_layer_to_cov_caches([layer_to_cov_cache_data, layer_to_cov_cache_data_new], normalize_trace_with_first=True)
+            opt = build_optimizer_with_cov_caches(model, hparams, [layer_to_cov_cache_old, layer_to_cov_cache_data], opt=opt)
+
+        elif hparams.edit_cache_style == 'mix':
+            old_txt_list = [item for sublist in txt_chunks for item in sublist]
+            old_tgt_list = [item for sublist in tgt_chunks for item in sublist]
+
+            layer_to_cov_cache_data_pretrain_mix = calculate_cov_cache_with_request(
+                old_txt_list,
+                old_tgt_list,
+                model,
+                tok,
+                hparams,
+            )
+
+            opt = build_optimizer_with_cov_caches(model, hparams, [layer_to_cov_cache_data_pretrain_mix], opt=opt)
+
+        metrics = calculate_old_loss(model, tok, hparams)
+        old_edit_loss = calculate_old_edit_loss(txt_chunks, tgt_chunks, model, tok)
+        metrics.update(old_edit_loss)
+        wandb.log(metrics) # fine to log even if empty, basically no-op
+
+    if hparams.perform_lora:
+        model = model.merge_and_unload()
     return model

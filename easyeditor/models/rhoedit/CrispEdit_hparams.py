@@ -7,7 +7,7 @@ from ...util.hparams import HyperParams
 
 
 @dataclass
-class SGDHyperParams(HyperParams):
+class AdamHyperParams(HyperParams):
     # Method
     layers: List[int]
     num_steps: int
@@ -32,25 +32,31 @@ class SGDHyperParams(HyperParams):
     mom2_dataset: str
     mom2_n_samples: int
     mom2_dtype: str
-    energy_threshold: float
 
     # Task/edit statistics for the soft K-FAC formulation.
     task_mom2_dataset: Optional[str] = None
     task_mom2_n_samples: Optional[int] = None
 
+    # Projection/K-FAC cache paths kept for compatibility with older configs.
+    base_kfac_cache_path: Optional[str] = None
+    task_kfac_cache_path: Optional[str] = None
+    additional_kfac_cache_path: Optional[str] = None
+    second_kfac_cache_path: Optional[str] = None
+    second_projection_kfac_cache_path: Optional[str] = None
+    projection_cache_path: Optional[str] = None
+    base_projection_cache_path: Optional[str] = None
+    primary_projection_cache_path: Optional[str] = None
+    task_projection_cache_path: Optional[str] = None
+    additional_projection_cache_path: Optional[str] = None
+    second_projection_cache_path: Optional[str] = None
+
     # Soft K-FAC controls.
     soft_lambda: float = 1.0
     use_second_projection: bool = False
-    newton_damping: float = 1e-3
-
-    # SGD controls.
-    sgd_momentum: float = 0.0
-    sgd_dampening: float = 0.0
-    sgd_nesterov: bool = False
-    sgd_maximize: bool = False
+    newton_damping: float = 1e-5
 
     # Runtime defaults used by run_crispedit.py/crispedit.py.
-    batch_size: int = 64
+    batch_size: int = 32
     max_length: int = 40
     model_parallel: bool = False
     edit_n_samples: int = 10
@@ -78,7 +84,7 @@ class SGDHyperParams(HyperParams):
             config = yaml.safe_load(stream) or {}
             config = super().construct_float_from_scientific_notation(config)
 
-        assert (config and config["alg_name"] == "CRISPEDIT") or print(
+        assert (config and config["alg_name"] == "CURPEDIT") or print(
             f"CrispEditHyperParams can not load from {hparams_name_or_path}, "
             f'alg_name is {config["alg_name"]} '
         )

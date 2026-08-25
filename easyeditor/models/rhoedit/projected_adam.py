@@ -5,11 +5,10 @@ from typing import Dict, Optional, Tuple
 
 import torch
 from dotenv import load_dotenv
-from torch.optim import Adam
+from torch.optim import Adam,SGD
 
 # 加载 .env 环境变量（STATS_DIR 等），供后续梯度范数统计的保存路径使用。
 load_dotenv()
-
 
 class ProjectedAdam(Adam):
     """
@@ -83,7 +82,7 @@ class ProjectedAdam(Adam):
         debug_grad_norm_stats: bool = True,  # 是否记录投影前后梯度范数
         grad_norm_stats_json_path: Optional[str] = None,
     ):
-        # 先调用 Adam 父类初始化（lr/betas/eps/weight_decay/amsgrad）。
+        # 先调用 Adam 父类初始化（lr/betas/eps/weight_decay/amsgrad）。      
         super().__init__(
             params,
             lr=lr,
@@ -699,10 +698,10 @@ class ProjectedAdam(Adam):
             eig_b,
         )
 
-        # R = Q^{-T} is the dual basis. Using R for analysis and Q for
-        # synthesis makes the unfiltered transform exactly reconstruct source.
-        coeffs = dual_q_b.T @ source @ dual_q_a
-        # 联合特征值外积 b_i * a_j，截断到非负。
+        #zwz临时修改：
+        coeffs = q_b.T @ source @ q_a
+        #coeffs = dual_q_b.T @ source @ dual_q_a
+
         joint_eigs = torch.outer(
             torch.clamp(eig_b.flatten(), min=0.0),
             torch.clamp(eig_a.flatten(), min=0.0),
@@ -711,8 +710,12 @@ class ProjectedAdam(Adam):
         # 软收缩分母：高能力方向 (b_i*a_j 大) 收缩更强。
         denom = 1.0 + float(soft_lambda) * joint_eigs
         # 预条件：谱空间逐元素除，再变回原空间。
+        #zwz:new plan
         filtered = q_b @ (coeffs / denom.clamp(min=1e-12)) @ q_a.T
-        # 对比！！！！！！！
+        edit_A = self._tensor(cache, "edit_A", source, compute_dtype)
+        edit_B = self._tensor(cache, "edit_B", source, compute_dtype)
+        filtered = edit_B @ filtered @ edit_A
+        #filtered = q_b @ filtered @ q_a.T
         #preconditioned = self._limit_relative_change(source, filtered)
         return filtered.to(dtype=tensor.dtype)
 
