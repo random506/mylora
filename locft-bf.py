@@ -160,7 +160,7 @@ if __name__ == "__main__":
     hparams = FTHyperParams.from_hparams(f"./hparams/FT/{args.model}") 
     hparams.batch_size = args.batch_size
 
-    save_model_name = f"{args.model}_{hparams.alg_name}_{args.data_type}"
+    save_model_name = f"{args.model}_LocBF-FT_{args.data_type}"
     print(f"Model will be saved to BASE_DIR/{save_model_name}")
     wandb.init(project=args.wandb_project, name=save_model_name, config=vars(hparams))
 

@@ -5,7 +5,6 @@ from dotenv import load_dotenv
 load_dotenv()
 import os
 os.environ["HF_DATASETS_CACHE"] = os.getenv("HF_DATASETS_DIR")
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"  # 只使用第1、2张显卡
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 import numpy as np
 import wandb
@@ -18,29 +17,6 @@ np.random.seed(SEED)
 torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
 torch.backends.cudnn.deterministic = True
-
-MYMODEL_SCHEMES = {
-    "scheme_a": (
-        SchemeAHyperParams,
-        "scheme_a_projected_lora",
-        apply_scheme_a_to_model,
-    ),
-    "scheme_b": (
-        SchemeBHyperParams,
-        "scheme_b_kfac_init_lora",
-        apply_scheme_b_to_model,
-    ),
-    "scheme_c": (
-        SchemeCHyperParams,
-        "scheme_c_crispedit_lora",
-        apply_scheme_c_to_model,
-    ),
-    "scheme_d": (
-        SchemeDHyperParams,
-        "scheme_d_adaptive_rank_lora",
-        apply_scheme_d_to_model,
-    ),
-}
 
 from easyeditor import (
     FTHyperParams,
