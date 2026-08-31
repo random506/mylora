@@ -18,6 +18,29 @@ torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
 torch.backends.cudnn.deterministic = True
 
+def resolve_local_model_name(model_name):
+    """Match server run_crispedit.py: load from HF_CACHE_DIR + hub id when that folder exists."""
+    if not model_name:
+        return model_name
+    cache = os.getenv("HF_CACHE_DIR") or ""
+    candidates = [model_name]
+    if cache:
+        candidates.append(cache + model_name)
+        candidates.append(os.path.join(cache.rstrip("/"), model_name))
+        candidates.append(os.path.join(cache.rstrip("/"), os.path.basename(str(model_name).rstrip("/"))))
+        if "/" not in str(model_name).strip("/"):
+            candidates.append(cache + "meta-llama/" + model_name)
+    seen = set()
+    for path in candidates:
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        if os.path.isfile(os.path.join(path, "config.json")):
+            print(f"Using local model: {path}")
+            return path
+    return model_name
+
+
 from easyeditor import (
     FTHyperParams,
     MENDHyperParams,
@@ -46,6 +69,16 @@ def get_arguments():
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size for fine-tuning in a sequential chunk. CAUTION: THIS IS HARDLY USED. MAKE SURE YOU KNOW WHAT YOU ARE DOING.')
     parser.add_argument('--wandb_project', type=str, default='CrispEdit', help='WandB project name.')
     parser.add_argument('--no_wandb', action='store_true', help='Disable wandb logging.')
+    parser.add_argument(
+        '--skip_task1_loss',
+        action='store_true',
+        help='Skip Wikipedia Task-1 loss. Implied by --no_wandb unless --task1_loss is set.',
+    )
+    parser.add_argument(
+        '--task1_loss',
+        action='store_true',
+        help='Force Wikipedia Task-1 loss even when --no_wandb is set.',
+    )
     args = parser.parse_args()
     return args
 
@@ -78,10 +111,32 @@ def get_hparams_and_editor(args):
         raise NotImplementedError
     
     hparams = editing_hparams.from_hparams(f"./hparams/{args.editing_method}/{args.model}")
+    hparams.model_name = resolve_local_model_name(hparams.model_name)
+    visible_gpus = torch.cuda.device_count()
+    if args.editing_method == "MEND":
+        # Last-layer einsum stays on one device. Two-GPU split still fills the last 48GB card.
+        # fp16 is read by BaseEditor even if the Llama-MEND bfloat16 branch is missing.
+        hparams.model_parallel = False
+        hparams.device = 0
+        hparams.fp16 = True
+        print("MEND: single GPU, half precision (device 0)")
+    elif visible_gpus == 1:
+        hparams.device = 0
+    elif visible_gpus >= 2:
+        # Scheduler sets CUDA_VISIBLE_DEVICES to two cards; split the model so one GPU does not OOM.
+        hparams.model_parallel = True
+        hparams.device = 0
+        print(f"Using model_parallel across {visible_gpus} GPUs")
     hparams.batch_size = args.num_edits ### NOTE: We try to match the naming convention in easy edit. batch_size here means the number of edits in a sequential edit.
     hparams.chunk_batch_size = args.batch_size ### NOTE: chunk_batch_size is the actual batch size for fine-tuning in a sequential chunk. Most methods in easyeditor do not use this parameter, so changing this will hardly affect anything.
     assert hparams.chunk_batch_size == 1 or (hparams.chunk_batch_size > 1 and args.editing_method in ['LoRA']), "Currently only LoRA supports batch fine-tuning. Are you sure what you are doing?"
     editor = BaseEditor.from_hparams(hparams)
+    if args.editing_method == "MEND":
+        print(f"MEND loaded dtype={getattr(editor.model, 'dtype', None)}")
+        if getattr(editor.model, "dtype", None) == torch.float32:
+            print("MEND is still fp32 after load; converting to bfloat16")
+            editor.model = editor.model.to(dtype=torch.bfloat16)
+            print(f"MEND converted dtype={editor.model.dtype}")
     return hparams, editor
 
 if __name__ == "__main__":
@@ -102,6 +157,10 @@ if __name__ == "__main__":
     else:
         batch_edit = False
 
+    skip_task1_loss = args.skip_task1_loss or (args.no_wandb and not args.task1_loss)
+    if skip_task1_loss:
+        print("Skipping Wikipedia Task-1 loss. Pass --task1_loss to keep it.")
+
     if batch_edit:
         edited_model, tokenizer = editor.batch_edit(
             prompts=prompts,
@@ -110,6 +169,7 @@ if __name__ == "__main__":
             target_new=target_new,
             locality_inputs=locality_inputs,
             eval_every=args.eval_every,
+            skip_task1_loss=skip_task1_loss,
         )
     else:
         edited_model, tokenizer = editor.edit(
@@ -120,6 +180,7 @@ if __name__ == "__main__":
             locality_inputs=locality_inputs,
             sequential_edit=sequential_edit,
             eval_every=args.eval_every,
+            skip_task1_loss=skip_task1_loss,
         )
 
     save_model_and_tokenizer(edited_model, tokenizer, save_model_name)

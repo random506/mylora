@@ -362,27 +362,28 @@ class MEND(EditableModel):
             targ = "ij"
         else:
             targ = "ji"
-        mean_grads = {
-            n: torch.einsum(f"bi,bj->{targ}", x, delta)
-            for n, (x, delta) in transformed_factors.items()
-        }
+        mean_grads = {}
+        for n, (x, delta) in transformed_factors.items():
+            mean_grads[n] = torch.einsum(f"bi,bj->{targ}", x, delta)
 
         info_dict = {}
         if return_factors:
             info_dict["factors"] = transformed_factors
-        idx = 0
-        for n, p in _inner_params(
-            self.model.named_parameters(), self.config.inner_params
-        ):
-            info_dict[f"grad/true_mag{idx}"] = p.grad.norm(2).item()
-            info_dict[f"grad/pseudo_mag{idx}"] = mean_grads[n].norm(2).item()
-            info_dict[f"grad/true_std{idx}"] = p.grad.std().item()
-            info_dict[f"grad/pseudo_std{idx}"] = mean_grads[n].std().item()
-            info_dict[f"grad/diff{idx}"] = (p.grad - mean_grads[n]).norm(2).item()
-            info_dict[f"grad/cos{idx}"] = F.cosine_similarity(
-                p.grad.reshape(-1), mean_grads[n].reshape(-1), dim=0
-            ).item()
-            idx += 1
+            idx = 0
+            for n, p in _inner_params(
+                self.model.named_parameters(), self.config.inner_params
+            ):
+                info_dict[f"grad/true_mag{idx}"] = p.grad.norm(2).item()
+                info_dict[f"grad/pseudo_mag{idx}"] = mean_grads[n].norm(2).item()
+                info_dict[f"grad/true_std{idx}"] = p.grad.std().item()
+                info_dict[f"grad/pseudo_std{idx}"] = mean_grads[n].std().item()
+                info_dict[f"grad/diff{idx}"] = (p.grad - mean_grads[n]).norm(2).item()
+                info_dict[f"grad/cos{idx}"] = F.cosine_similarity(
+                    p.grad.reshape(-1), mean_grads[n].reshape(-1), dim=0
+                ).item()
+                idx += 1
+        else:
+            del transformed_factors
 
         self.model.zero_grad()
 

@@ -2,7 +2,7 @@
 
 archive: ./results/models/MEND/llama-3-8b-ZsRE
 alg_name: "MEND"
-device: 1
+device: 0
 model_name: "meta-llama/Meta-Llama-3-8B-Instruct"
 
 model_class: LlamaForCausalLM

@@ -113,6 +113,10 @@ class BaseEditor:
                 self.tok = GPT2Tokenizer.from_pretrained(self.model_name)
                 self.tok.pad_token_id = self.tok.eos_token_id
             elif 'llama' in self.model_name.lower():
+                if hparams.alg_name == 'MEND' or getattr(hparams, 'fp16', False):
+                    mend_dtype = torch.bfloat16 if hparams.alg_name == 'MEND' else torch.float16
+                    model_kwargs = {**model_kwargs, "torch_dtype": mend_dtype}
+                    LOG.info(f"Loading Llama ({hparams.alg_name}) in {mend_dtype}")
                 self.model = AutoModelForCausalLM.from_pretrained(self.model_name, cache_dir=HF_CACHE_DIR, **model_kwargs)
                 self.tok = AutoTokenizer.from_pretrained(self.model_name, cache_dir=HF_CACHE_DIR, use_fast=False)
                 self.tok.pad_token_id = self.tok.eos_token_id
@@ -159,6 +163,17 @@ class BaseEditor:
             self.model.to(f'cuda:{hparams.device}')
 
         self.hparams = hparams
+
+    def _log_task1_loss(self, model, skip_task1_loss=False):
+        if skip_task1_loss:
+            return
+        task_loss = calculate_cache_loss(
+            model,
+            self.tok,
+            "wikipedia",
+            sample_size=100,
+        )
+        wandb.log({"Task 1 Loss": task_loss})
 
     def edit(self,
              prompts: Union[str, List[str]],
@@ -236,13 +251,8 @@ class BaseEditor:
         assert "eval_every" in kwargs, f'Method {self.alg_name} found, pls specify the eval_every....'
         eval_every = kwargs['eval_every']
         assert eval_every % self.hparams.batch_size == 0, "eval_every should be divisible by batch_size"
-        old_task_loss = calculate_cache_loss(
-            self.model,
-            self.tok,
-            "wikipedia",
-            sample_size=100
-        )
-        wandb.log({"Task 1 Loss": old_task_loss})
+        skip_task1_loss = kwargs.get("skip_task1_loss", False)
+        self._log_task1_loss(self.model, skip_task1_loss=skip_task1_loss)
         num_samples_processed = 0
 
         # edit process
@@ -262,13 +272,7 @@ class BaseEditor:
             num_samples_processed += len(record_chunks)
 
             if num_samples_processed % eval_every == 0:
-                new_task_loss = calculate_cache_loss(
-                    edited_model,
-                    self.tok,
-                    "wikipedia",
-                    sample_size=100
-                )
-                wandb.log({"Task 1 Loss": new_task_loss})
+                self._log_task1_loss(edited_model, skip_task1_loss=skip_task1_loss)
 
         return edited_model, self.tok
     
@@ -292,6 +296,7 @@ class BaseEditor:
         
         assert "eval_every" in kwargs, f'Method {self.alg_name} found, pls specify the eval_every....'
         eval_every = kwargs['eval_every']
+        skip_task1_loss = kwargs.get("skip_task1_loss", False)
 
         def edit_func(request):
             if self.alg_name == 'IKE' or self.alg_name == 'ICE':
@@ -325,24 +330,12 @@ class BaseEditor:
             for i, request in enumerate(tqdm(requests, total=len(requests))):
                 edited_model, weights_copy, icl_examples = edit_func(request)
                 if i % eval_every == 0:
-                    new_task_loss = calculate_cache_loss(
-                        edited_model,
-                        self.tok,
-                        "wikipedia",
-                        sample_size=100
-                    )
-                    wandb.log({"Task 1 Loss": new_task_loss})
+                    self._log_task1_loss(edited_model, skip_task1_loss=skip_task1_loss)
         else:
             for i, request in enumerate(tqdm(requests, total=len(requests))):
                 edited_model, weights_copy, icl_examples = edit_func(request)
                 if num_samples_processed % eval_every == 0:
-                    new_task_loss = calculate_cache_loss(
-                        edited_model,
-                        self.tok,
-                        "wikipedia",
-                        sample_size=100
-                    )
-                    wandb.log({"Task 1 Loss": new_task_loss})
+                    self._log_task1_loss(edited_model, skip_task1_loss=skip_task1_loss)
                 if self.alg_name == 'KN' or self.alg_name == 'GRACE' or self.alg_name == 'WISE':
                     with torch.no_grad():
                         weights_copy()
@@ -360,13 +353,7 @@ class BaseEditor:
         if isinstance(edited_model, LORA):
             edited_model = edited_model.model
 
-        new_task_loss = calculate_cache_loss(
-            edited_model,
-            self.tok,
-            "wikipedia",
-            sample_size=100
-        )
-        wandb.log({"Task 1 Loss": new_task_loss})
+        self._log_task1_loss(edited_model, skip_task1_loss=skip_task1_loss)
 
         return edited_model, self.tok
 

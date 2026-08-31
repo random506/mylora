@@ -5,7 +5,6 @@ from typing import Dict, List
 
 import hydra
 import torch
-from collections import deque
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from ...util.globals import *
@@ -34,18 +33,32 @@ class MendRewriteExecutor:
         # add_padding(self.tokenizer, self.model)
 
         # Load the trained MEND model
-        self.alg = MEND(self.model, params, lambda: deepcopy(self.model))
-        
-        ### WARNING: We removed the support for archive.
-        # d = torch.load(params.archive, map_location='cpu') 
+        param0 = next(self.model.parameters())
+        if param0.dtype == torch.float32:
+            # 48GB cards cannot hold Llama-3-8B fp32 + IDMLP[18432]. Convert even if
+            # BaseEditor loaded fp32 (old editor.py on the server).
+            device = torch.device(f"cuda:{params.device}")
+            print("[MEND] converting model fp32 -> bfloat16 via CPU to avoid 48GB OOM")
+            self.model = self.model.to("cpu").to(dtype=torch.bfloat16)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            self.model = self.model.to(device)
+            param0 = next(self.model.parameters())
 
-        # self.alg.load_state_dict(
-        #     {k.replace("gtn.", "mend."): v for k, v in d["model"].items()}
-        # )
-        # if params.model_parallel:
-        self.alg.mend.to(deque(self.alg.model.parameters(), maxlen=1)[0].device)
-        # else:
-        #     self.alg.to(torch.device(f'cuda:{params.device}'))
+        self.alg = MEND(self.model, params, lambda: deepcopy(self.model))
+        # Hypernetwork must stay fp32. GradientTransform.forward already casts hooked
+        # activations to float32; casting mend to bf16 caused BFloat16 != float in IDMLP.
+        self.alg.mend.to(device=param0.device)
+        mend0 = next(self.alg.mend.parameters())
+        print(
+            f"[MEND] model dtype={param0.dtype}, device={param0.device}; "
+            f"hypernet dtype={mend0.dtype}, device={mend0.device}"
+        )
+        if mend0.dtype != torch.float32:
+            raise RuntimeError(
+                f"MEND hypernet must be float32, got {mend0.dtype}. "
+                "Do not call mend.to(dtype=bfloat16)."
+            )
 
         # Disable unneeded gradients
         for n, p in self.model.named_parameters():
@@ -123,30 +136,23 @@ class MendRewriteExecutor:
         cond = {k: sent_tok[k] for k in ["input_ids", "attention_mask"]}
 
         self.alg.eval()
-        edited_model, model_info = self.alg.edit(edit_inner, cond, return_factors=True)
-        factors = {
-            k + "." + n: v.detach().cpu().numpy()
-            for k, pair in model_info["factors"].items()
-            for n, v in zip("uv", pair)
-        }
-        # Also keep these learned LRs.
-        factors["edit_lrs"] = self.alg.edit_lrs.detach().cpu().numpy()
-
-        # Edit!
-        d = factors
-        torch_factors = {k: torch.tensor(v) for k, v in d.items()}
-        eli = 0
-        edit_lrs = torch_factors["edit_lrs"]
-
+        # Weight updates already live on edited_model; skip GPU factor dumps (OOM on 48GB).
+        edited_model, _model_info = self.alg.edit(
+            edit_inner, cond, return_factors=False
+        )
+        inner = set(hparams.inner_params)
+        edited_state = edited_model.model.state_dict()
         with torch.no_grad():
             for n, p in model.named_parameters():
-                uname, vname = f"{n}.u", f"{n}.v"
-                if uname in torch_factors:
-                    if return_orig_weights and n not in weights_copy:
-                        weights_copy[n] = p.detach().clone()
-                    with torch.no_grad():
-                        p.copy_(edited_model.model.state_dict()[n])
+                if n not in inner:
+                    continue
+                if return_orig_weights and n not in weights_copy:
+                    weights_copy[n] = p.detach().clone()
+                p.copy_(edited_state[n])
 
+        del edited_model, _model_info, edited_state
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         return model, weights_copy
     
     
