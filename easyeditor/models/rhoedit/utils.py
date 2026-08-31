@@ -57,7 +57,7 @@ def _build_cov_cache_from_hparams(
 
     task_mom2_dataset = getattr(hparams, "task_mom2_dataset", None)
     task_sample_size= getattr(hparams, "task_mom2_n_samples", None)
-    print("[CrispEdit] Computing/loading base KFAC stats.")
+    print("[RhoEdit] Computing/loading base KFAC stats.")
     stats_dict = layer_stats_kfac_one_pass(
         model=model,
         tokenizer=tok,
@@ -72,7 +72,7 @@ def _build_cov_cache_from_hparams(
 
     task_stats_dict=None
     if task_mom2_dataset is not None:
-        print("[CrispEdit] Computing/loading task KFAC stats.")
+        print("[RhoEdit] Computing/loading task KFAC stats.")
         task_stats_dict = layer_stats_kfac_one_pass(
         model=model,
         tokenizer=tok,
@@ -535,8 +535,8 @@ def execute_sft_adam(
         for name, w in model.named_parameters():
             w.requires_grad = name in weights
     # 加快训练，省略old_loss计算
-    old_loss = calculate_old_loss(model, tok, hparams)
-    ExperimentTracker.log(old_loss) # fine to log even if empty, basically no-op
+    #old_loss = calculate_old_loss(model, tok, hparams)
+    #ExperimentTracker.log(old_loss) # fine to log even if empty, basically no-op
     loss_meter = AverageMeter()
     pbar = trange(hparams.num_steps)
     print("[execute_sft_adam]Start training\n")
@@ -577,9 +577,9 @@ def execute_sft_adam(
                 if should_recalculate:
                     opt = build_optimizer_with_cov_caches(model, hparams, [layer_to_cov_cache_old], opt=opt)
         # 加快训练，省略old_loss计算
-        metrics =calculate_old_loss(model, tok, hparams)
-        metrics.update({"FT Loss": loss_meter.avg})
-        #metrics = {"FT Loss": loss_meter.avg}
+        #metrics =calculate_old_loss(model, tok, hparams)
+        #metrics.update({"FT Loss": loss_meter.avg})
+        metrics = {"FT Loss": loss_meter.avg}
         ExperimentTracker.log(metrics) # fine to log even if empty, basically no-op
         
         pbar.write(f"FT Loss: {loss_meter.avg:.4f}")

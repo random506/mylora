@@ -21,8 +21,8 @@ from easyeditor.models.crispedit.utils import update_model_and_tokenizer_with_ap
 from easyeditor.models.crispedit.CrispEdit_hparams import CrispEditHyperParams
 from crispedit import *
 
-from easyeditor.models.curpedit import execute_sft_sgd , execute_sft_adam,execute_sft_adam_sequential
-from easyeditor.models.curpedit import SGDHyperParams,AdamHyperParams
+from easyeditor.models.rhoedit import execute_sft_sgd , execute_sft_adam,execute_sft_adam_sequential
+from easyeditor.models.rhoedit import SGDHyperParams,AdamHyperParams
 
 from easyeditor.tools import ExperimentTracker
 
@@ -45,7 +45,7 @@ def get_arguments():
                                  'safeedit_train', 'safeedit_test'])
 
     parser.add_argument('--alg_name', required=True, type=str, default='lora',
-                        choices=['crispedit','curpedit_adam','curpedit_sgd'])
+                        choices=['crispedit','rhoedit_adam','rhoedit_sgd'])
     parser.add_argument('--cache_sample_num', type=int, default=10000,
                         help='Number of samples to use for caching projection matrices.')
     parser.add_argument('--edit_sample_num', type=int, default=3000,
@@ -117,13 +117,13 @@ def get_arguments():
 
 def get_hparams(args):
     # 暂时拆分开进行判断，后续需要合并成一个
-    if args.alg_name == "curpedit_sgd":
-        print("[run_sgd] 加载 curpedit SGD 配置")
-        hparams = SGDHyperParams.from_hparams(f"./hparams/CurpEdit/{args.model}")
+    if args.alg_name == "rhoedit_sgd":
+        print("[run_sgd] 加载 RhoEdit SGD 配置")
+        hparams = SGDHyperParams.from_hparams(f"./hparams/RhoEdit/{args.model}")
 
-    elif args.alg_name == "curpedit_adam":
-        print("[run_adam] 加载 CurpEdit Adam 配置")
-        hparams = AdamHyperParams.from_hparams(f"./hparams/CurpEdit/{args.model}")
+    elif args.alg_name == "rhoedit_adam":
+        print("[run_adam] 加载 RhoEdit Adam 配置")
+        hparams = AdamHyperParams.from_hparams(f"./hparams/RhoEdit/{args.model}")
 
 
     hparams.batch_size = args.batch_size
@@ -165,7 +165,7 @@ def calculate_model_name(args, hparams):
         name = f"{args.model}_LoRA_FT_{args.data_type}"
     elif args.no_crisp:
         name = f"{args.model}_FT_{args.data_type}"
-    elif args.alg_name == "curpedit_sgd" or args.alg_name == "curpedit_adam":
+    elif args.alg_name == "rhoedit_sgd" or args.alg_name == "rhoedit_adam":
         name = (f"{args.model}_{args.alg_name}_{args.data_type}"
                         f"_{hparams.newton_damping}_{hparams.soft_lambda}_{hparams.lr}")
     else:
@@ -224,9 +224,9 @@ if __name__ == "__main__":
     
     
     print_time("Begin FT Time")
-    if args.alg_name == "curpedit_sgd":
+    if args.alg_name == "rhoedit_sgd":
          edited_model = execute_sft_sgd(model, tokenizer, requests, hparams)
-    elif args.alg_name == "curpedit_adam":
+    elif args.alg_name == "rhoedit_adam":
          edited_model = execute_sft_adam(model, tokenizer, requests, hparams)
     elif args.sequential_edit:
         edited_model = execute_sft_adam_sequential(model, tokenizer, requests, hparams)

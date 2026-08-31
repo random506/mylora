@@ -2,7 +2,7 @@
 #   1. prompt_last: the method of ROME's (https://arxiv.org/abs/2202.05262) original paper, which calculates nll loss through the last token of the input.
 #   2. target_new: the standard autoregressive method, using the cross-entropy loss function
 
-alg_name: "CRISPEDIT"
+alg_name: "RHOEDIT"
 device: 0
 model_name: "meta-llama/Meta-Llama-3-8B-Instruct"
 
@@ -14,6 +14,7 @@ lr: 5e-4
 weight_decay: 0
 kl_factor: 0
 norm_constraint: false
+
 # "prompt_last" corresponds to the results of FT-L.
 # "target_new" corresponds to the results of FT-M.
 objective_optimization: "target_new"
@@ -27,16 +28,13 @@ model_parallel: false
 mom2_dataset: "wikipedia"
 mom2_n_samples: 10000
 mom2_dtype: "float32"
-energy_threshold: 0.8
-task_mom2_dataset: "wiki_big_edit_3k"
+task_mom2_dataset: "counterfact-edit_3k"
 task_mom2_n_samples: 3000
+task_dtype: "float32"
 
-#base_kfac_cache_path: "/home/zwz/01_crispedit/Meta-Llama-3-8B-Instruct/wikipedia_stats"
-#task_kfac_cache_path: "/home/zwz/01_crispedit/Meta-Llama-3-8B-Instruct/zsre_mend_163k_stats"
-#projection_cache_path: null
-#task_projection_cache_path: null
-newton_damping:  1e-5
-soft_lambda: 1
+
+newton_damping:  1e-2
+soft_lambda: 0.1
 #soft_lambda = 1    -> 缩放 = 1 / 2 = 0.5
 #soft_lambda = 9    -> 缩放 = 1 / 10 = 0.1
 #soft_lambda = 99   -> 缩放 = 1 / 100 = 0.01

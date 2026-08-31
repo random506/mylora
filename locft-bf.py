@@ -166,8 +166,20 @@ if __name__ == "__main__":
 
 
     MODEL_NAME = hparams.model_name
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, cache_dir=HF_CACHE_DIR)
-    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, cache_dir=HF_CACHE_DIR, device_map='auto')
+    cache = HF_CACHE_DIR or ""
+    for candidate in (
+        MODEL_NAME,
+        cache + MODEL_NAME,
+        os.path.join(cache.rstrip("/"), MODEL_NAME) if cache else "",
+        os.path.join(cache.rstrip("/"), os.path.basename(str(MODEL_NAME).rstrip("/"))) if cache else "",
+        cache + "meta-llama/" + MODEL_NAME if cache and "/" not in str(MODEL_NAME).strip("/") else "",
+    ):
+        if candidate and os.path.isfile(os.path.join(candidate, "config.json")):
+            MODEL_NAME = candidate
+            print(f"Using local model: {MODEL_NAME}")
+            break
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, local_files_only=True)
+    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, device_map="auto", local_files_only=True)
     device = model.device
 
     # set appropriate padding token

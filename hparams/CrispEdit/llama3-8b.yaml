@@ -2,7 +2,7 @@
 #   1. prompt_last: the method of ROME's (https://arxiv.org/abs/2202.05262) original paper, which calculates nll loss through the last token of the input.
 #   2. target_new: the standard autoregressive method, using the cross-entropy loss function
 
-alg_name: "CrispEdit"
+alg_name: "CRISPEDIT"
 device: 0
 model_name: "meta-llama/Meta-Llama-3-8B-Instruct"
 
@@ -25,6 +25,6 @@ ln_f_module: "model.norm"
 lm_head_module: "lm_head"
 model_parallel: false
 mom2_dataset: "wikipedia"
-mom2_n_samples: 1000
+mom2_n_samples: 10000
 mom2_dtype: "float32"
 energy_threshold: 0.99

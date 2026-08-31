@@ -84,8 +84,8 @@ class AdamHyperParams(HyperParams):
             config = yaml.safe_load(stream) or {}
             config = super().construct_float_from_scientific_notation(config)
 
-        assert (config and config["alg_name"] == "CURPEDIT") or print(
-            f"CrispEditHyperParams can not load from {hparams_name_or_path}, "
+        assert (config and config["alg_name"] == "RHOEDIT") or print(
+            f"RhoEditHyperParams can not load from {hparams_name_or_path}, "
             f'alg_name is {config["alg_name"]} '
         )
 

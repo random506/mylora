@@ -14,7 +14,6 @@ run.sh
 run_edited_benchmarks_chunk.py
 Meta-Llama-3-8B-Instruct/
 swanlog/
-data/
 scripts/
 docs/
 launch_when_ready.sh
@@ -33,4 +32,10 @@ projected_adam_factor_stats.json
 projected_adam_grad_norm_stats.json
 projected_sgd_factor_stats.json
 .vscode/
-
+20260827_table1-easyeditor-baselines.sh
+20260827_table1-easyeditor-baselines-wiki.sh
+20260827_table1-easyeditor-baselines-counterfact.sh
+experiments/_common_curvature.py
+experiments/run_experiment2_soft_vs_hard.py
+easyeditor/evaluate.needcheck/
+logs_error/
