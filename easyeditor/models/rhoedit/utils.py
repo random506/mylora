@@ -292,7 +292,7 @@ def build_optimizer_with_cov_caches(
         ),
         factor_damping=getattr(
             hparams,
-            "factor_damping",
+            "newton_damping",
             1e-5,
         ),
         lr=hparams.lr,

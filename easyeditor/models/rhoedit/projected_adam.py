@@ -711,10 +711,13 @@ class ProjectedAdam(Adam):
         denom = 1.0 + float(soft_lambda) * joint_eigs
         # 预条件：谱空间逐元素除，再变回原空间。
         #zwz:new plan
+        '''
         filtered = q_b @ (coeffs / denom.clamp(min=1e-12)) @ q_a.T
         edit_A = self._tensor(cache, "edit_A", source, compute_dtype)
         edit_B = self._tensor(cache, "edit_B", source, compute_dtype)
         filtered = edit_B @ filtered @ edit_A
+        '''
+        filtered = dual_q_b @ (coeffs / denom.clamp(min=1e-12)) @ dual_q_a.T
         #filtered = q_b @ filtered @ q_a.T
         #preconditioned = self._limit_relative_change(source, filtered)
         return filtered.to(dtype=tensor.dtype)
