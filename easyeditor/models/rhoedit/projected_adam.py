@@ -301,6 +301,11 @@ class ProjectedAdam(Adam):
         self._check_square(edit_factor, "edit_factor")
         self._check_square(cap_factor, "cap_factor")
 
+        cache_dtype = edit_factor.dtype
+        # 只在构造广义基时使用 float64。
+        edit_factor = edit_factor.to(dtype=torch.float64)
+        cap_factor = cap_factor.to(dtype=torch.float64)
+        
         # 1) 对称化，消除数值不对称。
         edit_factor = self._symmetrize(edit_factor)
         cap_factor = self._symmetrize(cap_factor)
@@ -356,7 +361,7 @@ class ProjectedAdam(Adam):
         ):
             raise RuntimeError("generalized basis produced non-finite values, check factor conditioning")
 
-        return q.contiguous(), dual_q.contiguous(), cap_eigs.contiguous()
+        return q.to(dtype=cache_dtype).contiguous(),dual_q.to(dtype=cache_dtype).contiguous(),cap_eigs.to(dtype=cache_dtype).contiguous()
 
     # ======================================================================
     # 广义基的获取：优先用缓存里现成的，否则从 A/B 因子现算并回写缓存。
