@@ -37,3 +37,4 @@ xformers==0.0.27.post2
 lm_eval==0.4.8
 vllm==0.6.3.post1
 swanlab
+

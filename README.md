@@ -1,51 +1,105 @@
-# CrispEdit / CurpEdit
+# RhoEdit
 
-本仓库用于研究大语言模型知识编辑中的能力保持问题。当前主线是在 EasyEdit 风格的编辑框架上实现基于 K-FAC 曲率统计的 **CrispEdit**，以及使用软投影 / Newton 预条件的 **CurpEdit-Adam** 和 **CurpEdit-SGD**；仓库同时保留多种基线算法、实验性 LoRA 变体、vLLM 评测和结果汇总工具。
+本仓库用于研究大语言模型知识编辑中的“编辑效果与原有能力保持”问题。当前主方法是 **RhoEdit**：利用编辑数据与能力保持数据的 K-FAC 曲率统计，在广义特征空间中对梯度进行软约束预条件，再交给 Adam 或 SGD 更新模型参数。
 
-CrispEdit 论文：<https://arxiv.org/abs/2602.15823>
+仓库同时保留 CrispEdit、FT、LoRA、LocBF-FT、MEND、MEMIT、AlphaEdit、AlphaEditFT、ROME、UltraEdit 和 WISE，用作对比方法或消融实验。本文档以 2026-09-08 的代码状态为准；存在但尚未完整接线的入口会在“当前限制”中明确说明。
 
-> 本仓库是研究代码快照，不是开箱即用的软件包。模型、编辑数据和 K-FAC 缓存未纳入版本控制，部分旧入口与配置仍有已知问题。首次运行前请先阅读[当前限制](#当前限制)。
+## 方法概览
 
-## 功能概览
+RhoEdit 在每个待编辑权重块上同时考虑两类曲率：
 
-| 范围 | 内容 | 主要位置 |
-| --- | --- | --- |
-| 主编辑方法 | CrispEdit、CurpEdit-Adam、CurpEdit-SGD | `run_crispedit.py`、`crispedit.py`、`easyeditor/models/{crispedit,curpedit}/` |
-| 上游编辑算法 | ROME、MEMIT、FT、MEND、LoRA、WISE、AlphaEdit、UltraEdit 等 | `easyeditor/models/`、`easyeditor/util/alg_dict.py` |
-| 实验性方法 | 投影 LoRA、Curvature/Leaky LoRA、SAFE-LoRA、参数投影 | `easyeditor/mymodels/` |
-| 编辑质量评测 | rewrite、rephrase、locality；exact match 或 LLM judge | `run_edited_benchmarks.py`、`easyeditor/evaluate/` |
-| 基础能力评测 | IFEval、TruthfulQA MC2、MMLU、GSM8K CoT、ARC Challenge | `run_base_benchmarks.py` |
-| 结果分析 | 汇总 `capability.json` 和两个上下文的 `mean_metrics.json` | `skills/analyze-results/collect_runs.py` |
-| 小规模验证 | LeNet 上的 K-FAC、Hessian、Gauss-Newton 投影对比 | `toy_experiment/` |
+- 编辑曲率：由 `task_mom2_dataset` 或当前编辑请求得到，记为 `A_e`、`B_e`。
+- 能力曲率：由 `mom2_dataset` 的预训练/保持数据得到，记为 `A_c`、`B_c`。
 
-`easyeditor/` 还包含多模态、人格、安全和概念编辑基础设施。源码中存在某个模型或算法分支，不等于仓库已经提供相应配置、checkpoint 或完成该组合的验证。
+代码中的软约束 Newton 系统为：
 
-## 仓库结构
+```text
+B_e * dW * A_e + lambda * B_c * dW * A_c = -G
+```
+
+`ProjectedAdam` 和当前软约束版 `ProjectedSGD` 会构造广义基，使编辑曲率被白化、能力曲率被对角化：
+
+```text
+Q_A^T A_e Q_A = I
+Q_A^T A_c Q_A = diag(a)
+
+Q_B^T B_e Q_B = I
+Q_B^T B_c Q_B = diag(b)
+```
+
+随后按下面的谱过滤形式处理梯度：
+
+```text
+G_projected = Q_B [ (R_B^T G R_A) / (1 + lambda * outer(b, a)) ] Q_A^T
+```
+
+其中：
+
+- `soft_lambda` 控制能力保持约束。值越大，高能力曲率方向的更新收缩越强。
+- `newton_damping` 为编辑曲率的相对阻尼，用于改善 Cholesky 分解和广义特征分解的数值稳定性。
+- `lr` 控制预条件后 Adam/SGD 的实际更新步长。
+- `mom2_n_samples` 和 `task_mom2_n_samples` 分别控制能力统计与编辑任务统计的样本数。
+
+## RhoEdit 实现
+
+| 文件 | 作用 |
+| --- | --- |
+| `run_rhoedit.py` | RhoEdit 命令行入口、模型加载、CLI 参数覆盖、模型保存 |
+| `hparams/RhoEdit/*.yaml` | 不同模型的编辑层、数据集、学习率和 soft K-FAC 参数 |
+| `easyeditor/models/rhoedit/utils.py` | Adam 路径：统计加载、缓存构造、训练循环、顺序编辑实验实现 |
+| `easyeditor/models/rhoedit/projected_adam.py` | 广义特征分解、谱过滤、Adam 动量重投影和诊断统计 |
+| `easyeditor/models/rhoedit/utils_sgd.py` | SGD 路径的缓存构造与训练循环 |
+| `easyeditor/models/rhoedit/projected_adam_sgd.py` | 当前 soft K-FAC SGD 优化器实现 |
+| `easyeditor/models/rhoedit/CrispEdit_hparams.py` | Adam 超参数 dataclass 和 YAML 加载器 |
+| `easyeditor/models/rhoedit/CrispEdit_hparams_sgd.py` | SGD 超参数 dataclass 和 YAML 加载器 |
+| `easyeditor/models/rome/layer_stats.py` | 当前 RhoEdit 实际调用的 K-FAC 数据加载与统计实现 |
+| `easyeditor/tools/tracker.py` | W&B、SwanLab 或无跟踪模式的统一接口 |
+
+当前 Adam 流程如下：
+
+```text
+run_rhoedit.py
+  -> 读取 hparams/RhoEdit/<model>.yaml
+  -> 加载本地模型与 tokenizer
+  -> 计算或读取能力数据 K-FAC 统计
+  -> 计算或读取编辑任务 K-FAC 统计
+  -> 构造 ProjectedAdam
+  -> 只训练 YAML layers 对应的 down_proj 权重
+  -> 保存完整模型与 tokenizer 到 HF_CACHE_DIR
+```
+
+`ProjectedAdam` 在缓存切换时还会重新投影已有 Adam 一阶动量，避免动量继续停留在旧曲率基中。默认会记录广义特征值和投影前后梯度范数，文件位置由实现和 `STATS_DIR` 决定。
+
+## 目录结构
 
 ```text
 .
 |-- easyeditor/
-|   |-- dataset/          # 数据集封装
-|   |-- editors/          # 通用编辑器接口
-|   |-- evaluate/         # vLLM 及专项评测
-|   |-- models/           # EasyEdit 基线与 CrispEdit/CurpEdit
-|   |-- mymodels/         # 实验性 LoRA/投影方法
-|   |-- tools/            # W&B / SwanLab 追踪器
-|   `-- trainer/          # MEND/SERAC/MALMEN 等训练基础设施
-|-- hparams/              # 按算法和模型组织的 YAML 配置
-|-- skills/               # 实验规划与结果分析工具
-|-- toy_experiment/       # 小模型曲率投影实验
-|-- run_crispedit.py      # 主编辑入口
-|-- run_base_benchmarks.py
-|-- run_edited_benchmarks.py
-`-- utils.py              # 根入口共用的数据与保存逻辑
+|   |-- editors/                 # EasyEdit 风格编辑器接口
+|   |-- evaluate/                # 编辑质量和安全性评测
+|   |-- models/
+|   |   |-- rhoedit/             # 主方法 RhoEdit
+|   |   |-- crispedit/           # CrispEdit 对比方法
+|   |   `-- ...                  # 其他 EasyEdit 基线
+|   |-- tools/                   # W&B / SwanLab 跟踪器
+|   `-- trainer/                 # MEND 等训练组件
+|-- hparams/                     # 按方法和模型组织的 YAML
+|-- data/                        # 编辑数据集
+|-- scripts/experiments/         # GPU 调度和批量实验脚本
+|-- scripts/hparam_search.py     # RhoEdit 历史超参搜索辅助器
+|-- run_rhoedit.py               # RhoEdit 主入口
+|-- run_crispedit.py             # CrispEdit / FT / LoRA 对比入口
+|-- edit.py                      # EasyEdit 基线统一入口
+|-- run_base_benchmarks.py       # 原有能力评测
+|-- run_edited_benchmarks.py     # 编辑成功率与泛化评测
+`-- utils.py                     # 数据读取与模型保存
 ```
 
-`logs/`、`docs/experiments/`、`data/`、模型目录和统计缓存都是本地生成或外部准备的内容，默认不应提交。
+`logs/`、模型目录、K-FAC 缓存和 `docs/experiments/` 下的结果分析属于运行产物，不应默认作为源代码提交。
 
 ## 环境安装
 
-完整编辑和 vLLM 评测面向 Linux、NVIDIA GPU 与 CUDA 环境。历史文档使用 Python 3.9；依赖固定了 `torch==2.4.0`、`transformers==4.46.2`、`vllm==0.6.3.post1` 和 `lm_eval==0.4.8`。
+完整训练和评测主要面向 Linux、NVIDIA GPU 与 CUDA 环境。依赖中固定了 `torch==2.4.0`、`transformers==4.46.2`、`vllm==0.6.3.post1` 和 `lm_eval==0.4.8`。
 
 ```bash
 python3.9 -m venv .venv
@@ -54,249 +108,335 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-若安装时遇到 `pyarrow` 与 `datasets` 的兼容问题，可在确认环境约束后尝试：
-
-```bash
-python -m pip install --upgrade datasets pyarrow
-```
-
-模型编辑、K-FAC 统计和 vLLM 评测通常需要大显存 GPU；仅结果收集器和部分诊断可以在 CPU 上运行。
+仅查看脚本或运行结果收集器不需要 GPU；RhoEdit 训练、K-FAC 统计和 vLLM 评测通常需要较大显存。
 
 ## 环境变量
 
-先从模板创建本地配置：
+从模板创建本地配置：
 
 ```bash
 cp .env.example .env
 ```
 
-建议至少配置：
+建议配置：
 
 ```dotenv
 HF_CACHE_DIR=/absolute/path/to/models/
 HF_DATASETS_DIR=/absolute/path/to/hf_datasets
 STATS_DIR=/absolute/path/to/kfac_stats
-EDIT_DATA_DIR=/absolute/path/to/this/repo/data
-HF_ENDPOINT=https://huggingface.co
+EDIT_DATA_DIR=/absolute/path/to/repo/data
+
+BASE_URL=https://openrouter.ai/api/v1
+MODEL=deepseek/deepseek-v4-flash
+API_KEY=
+
+WANDB_API_KEY=
+SWANLAB_API_KEY=
+
+HF_DATASETS_OFFLINE=1
+HF_HUB_OFFLINE=1
 ```
 
-| 变量 | 用途 | 何时需要 |
+注意事项：
+
+- `HF_CACHE_DIR` 必须以 `/` 结尾。训练保存和编辑质量评测仍使用字符串拼接路径。
+- `run_rhoedit.py` 使用 `local_files_only=True`。模型必须已经下载到本地，或 YAML 的 `model_name` 必须能在本地 Hugging Face 缓存中解析。
+- 如果本地没有数据集缓存，应暂时移除或关闭 `HF_DATASETS_OFFLINE`、`HF_HUB_OFFLINE`。
+- `STATS_DIR` 保存 K-FAC 统计；不同模型、数据集、层和样本数会生成不同缓存。
+- `EDIT_DATA_DIR` 供 K-FAC 数据加载器查找 CounterFact、ZsRE 和 WikiBigEdit 等本地 JSON。
+- 只有使用 LLM-as-a-Judge 时才需要 `BASE_URL`、`MODEL` 和 `API_KEY`。
+
+不要提交 API 密钥、服务器绝对路径、模型 checkpoint 或原始实验日志。
+
+## 数据集
+
+| `data_type` | 编辑数据文件 | `run_rhoedit.py` |
 | --- | --- | --- |
-| `HF_CACHE_DIR` | 模型查找前缀和编辑后模型的保存根目录 | 编辑与编辑质量评测必需 |
-| `HF_DATASETS_DIR` | Hugging Face 数据缓存；部分模块导入时就会读取 | 主入口必需 |
-| `STATS_DIR` | K-FAC 协方差 / 投影缓存根目录 | CrispEdit、CurpEdit 和相关诊断必需 |
-| `EDIT_DATA_DIR` | K-FAC 任务统计所使用的 JSON 数据目录 | 使用编辑数据计算统计时必需 |
-| `API_KEY` | LLM-as-a-Judge 的访问密钥 | `llm_judge` 评测必需 |
-| `SWANLAB_API_KEY` | SwanLab 登录密钥 | 启用 SwanLab 时需要 |
-| `WANDB_API_KEY` | W&B 登录密钥；模板中尚未列出 | 启用 W&B 时需要 |
+| `zsre` | `data/zsre_mend_3k.json` | 支持 |
+| `zsre10k` | `data/zsre_mend_10k.json` | 支持 |
+| `counterfact` | `data/counterfact-edit_3k.json` | 支持 |
+| `wiki` | `data/wiki_big_edit_3k.json` | 支持 |
+| `safeedit_train` | `data/SafeEdit_train.json` | 实验性支持 |
+| `safeedit_test` | `data/SafeEdit_test.json` | 实验性支持 |
 
-当前若干脚本用字符串拼接处理 `HF_CACHE_DIR`，因此该值应为绝对目录并以 `/` 结尾。`run_crispedit.py` 使用 `local_files_only=True`，不会在编辑时自动下载模型；请预先下载模型，并在对应 YAML 的 `model_name` 中填写可解析的本地路径或已缓存的 Hub ID。不要把令牌或机器路径提交到仓库。
+RhoEdit 同时读取 YAML 中的两个统计数据集参数：
 
-## 数据准备
+```yaml
+mom2_dataset: "wikipedia"
+task_mom2_dataset: "counterfact-edit_3k"
+```
 
-编辑入口直接从仓库根目录下的 `data/` 读取 JSON；本仓库当前不包含这些文件。
+`--data_type` 只决定本次训练请求，不会自动修改 `task_mom2_dataset`。运行不同数据集实验前，必须检查 YAML 中的任务统计数据是否符合实验设计。例如运行 ZsRE 时，如需使用 ZsRE 编辑曲率，应将 `task_mom2_dataset` 配置为相应的 ZsRE 数据名，而不是继续沿用 CounterFact。
 
-| `data_type` | 期望文件 | 当前入口 |
-| --- | --- | --- |
-| `zsre` | `data/zsre_mend_3k.json` | 编辑、编辑质量评测 |
-| `zsre10k` | `data/zsre_mend_10k.json` | `run_crispedit.py` |
-| `counterfact` | `data/counterfact-edit_3k.json` | 编辑、编辑质量评测 |
-| `wiki` | `data/wiki_big_edit_3k.json` | 编辑、编辑质量评测 |
-| `safeedit_train` | `data/SafeEdit_train.json` | 主编辑入口、安全评测 |
-| `safeedit_test` | `data/SafeEdit_test.json` | 主编辑入口、安全评测 |
-| `multi_counterfact` | `data/multi_counterfact.json` | 编辑质量评测 |
+## 模型配置
 
-主要字段约定：
-
-- ZsRE：`src`、`subject`、`rephrase`、`alt`、`loc`、`loc_ans`。
-- CounterFact / Wiki：`prompt`、`subject`、`rephrase_prompt`、`target_new`、`locality_prompt`、`locality_ground_truth`。
-- SafeEdit：`adversarial prompt`、`safe generation`、`unsafe generation`、`generalization test`、`question`。
-
-K-FAC 的 `mom2_dataset: wikipedia` 或 `wikitext` 通过 Hugging Face Datasets 加载并优先使用 `HF_DATASETS_DIR` 中的缓存；任务统计数据则可能通过 `EDIT_DATA_DIR` 查找。
-
-## 模型与超参数
-
-`--model` 不是任意模型路径，而是配置文件名。例如：
+`--model` 表示配置文件名，不是任意 Hugging Face 模型路径：
 
 ```text
 --model llama3-8b
-        -> hparams/CrispEdit/llama3-8b.yaml
-        -> hparams/CurpEdit/llama3-8b.yaml
+    -> hparams/RhoEdit/llama3-8b.yaml
+
+--model llama3.2-3b
+    -> hparams/RhoEdit/llama3.2-3b.yaml
 ```
 
-运行前至少核对 YAML 中的 `model_name`、`layers`、`rewrite_module_tmp`、`device`、学习率和统计数据设置。当前已有配置如下；“已有 YAML”不代表该组合已经在当前机器上验证。
+当前 `hparams/RhoEdit/` 包含：
 
-| 配置族 | 已有 YAML |
-| --- | --- |
-| CrispEdit、CurpEdit、FT、MEMIT | `llama3-8b`、`mistral-7b`、`qwen2.5-7b` |
-| AlphaEdit | `llama3-8b`、`qwen2.5-7b` |
-| AlphaEditFT | `llama3-8b`、`mistral-7b`、`qwen2.5-7b` |
-| LoRA、MEND、MyEdit、MyLoRA | `llama3-8b`、`qwen2.5-7b` |
-| ROME | `llama3-8b copy`、`mistral-7b`、`qwen2.5-7b` |
-| WISE | `llama3-8b`、`mistral-7b`、`qwen2.5-7b` |
-| UltraEdit | `gemma-3-27b`、`gpt-j-6B`、`llama3-8b`、`mistral-7b`、`phi-4`、`qwen2.5-7b` |
+| 配置 | 模型 | 编辑层 | 当前状态 |
+| --- | --- | --- | --- |
+| `llama3-8b.yaml` | Llama 3 8B Instruct | 19-23 | Adam 加载器所需的 `RHOEDIT` 标识已配置 |
+| `llama3.2-3b.yaml` | Llama 3.2 3B Instruct | 16-20 | 根据 28 层结构生成的初始参数，尚需实验调优 |
+| `qwen2.5-7b.yaml` | Qwen2.5 7B Instruct | 15-19 | 当前仍写为 `CRISPEDIT`，不能直接通过 RhoEdit Adam 加载器 |
 
-部分基线配置仍包含原作者机器路径、`your/path/...` 占位符或外部 checkpoint；使用前必须改成本机资源。`MyEdit` 和 `MyLoRA` 配置目前没有接入主 CLI。
+所有对比方法目录也提供了 `llama3.2-3b.yaml`，用于后续统一比较；这些配置是根据 Llama 3 8B 和 Qwen2.5 7B 相对层深生成的初始值，不代表已经完成 GPU 基准验证。
 
-## 运行编辑
+## 运行 RhoEdit
 
-所有命令都应从仓库根目录执行。当前接线最完整的是 Llama/Qwen 的 CurpEdit 分支。下面以 CurpEdit-Adam 为例：
+下面的例子使用当前 Llama 3 8B 配置，并选择与 YAML 任务统计一致的 CounterFact：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python run_crispedit.py \
+CUDA_VISIBLE_DEVICES=0 python run_rhoedit.py \
   --model llama3-8b \
-  --data_type wiki \
-  --alg_name curpedit_adam \
+  --data_type counterfact \
+  --alg_name rhoedit_adam \
   --cache_sample_num 10000 \
-  --energy_threshold 0.5 \
+  --edit_sample_num 3000 \
   --batch_size 32 \
   --lr 5e-4 \
-  --plat_name none
+  --newton_damping 1e-2 \
+  --soft_lambda 0.1 \
+  --plat_name none \
+  --no_wandb
 ```
 
-将 `--alg_name` 改为 `curpedit_sgd` 可使用 SGD 版本。CurpEdit 会用 CLI 的 `--lr` 覆盖 YAML，而该参数默认值是 `0.7`，因此务必显式给出合理学习率。
+主要参数：
 
-主入口可选算法只有：
+| 参数 | 含义 |
+| --- | --- |
+| `--model` | `hparams/RhoEdit/` 下的配置文件名 |
+| `--data_type` | 本次编辑数据集 |
+| `--alg_name` | 当前建议使用 `rhoedit_adam` |
+| `--cache_sample_num` | 能力保持 K-FAC 统计样本数 |
+| `--edit_sample_num` | 任务 K-FAC 统计样本数 |
+| `--batch_size` | 编辑训练 batch size |
+| `--lr` | Adam/SGD 学习率，覆盖 YAML |
+| `--newton_damping` | 广义特征分解阻尼，覆盖 YAML |
+| `--soft_lambda` | 能力保持软约束强度，覆盖 YAML |
+| `--recalculate_cache` | 权重变化超过阈值时重新计算能力统计 |
+| `--recalculate_weight_threshold` | 触发重算的相对权重变化阈值 |
+| `--plat_name` | `wandb`、`swanlab` 或 `none` |
+
+输出目录名由模型、算法、数据集、阻尼、`lambda` 和学习率组成，例如：
 
 ```text
-crispedit | curpedit_adam | curpedit_sgd
+llama3-8b_rhoedit_adam_counterfact_0_01_0_1_0_0005
 ```
 
-CrispEdit 的预期命令形式如下，但当前 YAML 的 `alg_name` 大小写与加载器不一致；需先按[当前限制](#当前限制)修正配置后再运行：
+完整模型和 tokenizer 会保存到：
+
+```text
+${HF_CACHE_DIR}<run-id>/
+```
+
+### 诊断输出
+
+`ProjectedAdam` 当前默认启用谱统计与梯度范数统计。常见输出包括：
+
+```text
+projected_adam_factor_stats.json
+${STATS_DIR}/projected_adam_grad_norm_stats.json
+```
+
+这些文件用于检查广义特征值分布、阻尼是否足够，以及投影前后梯度收缩比例。批量实验时应按 run 隔离或及时归档，避免后一次运行覆盖前一次结果。
+
+## 超参数搜索
+
+RhoEdit 的主要搜索轴是：
+
+```text
+lr -> newton_damping -> soft_lambda
+```
+
+`scripts/hparam_search.py` 实现了命令生成、结果读取和按 WILD/能力下降约束排序的逻辑，历史网格为：
+
+```text
+lr:              5e-5, 1e-4, 2e-4, 5e-4, 1e-3
+newton_damping:  1e-5, 1e-3, 1e-2, 1e-1
+soft_lambda:     0.1, 1.0, 9.0
+```
+
+查看搜索协议：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python run_crispedit.py \
-  --model llama3-8b \
-  --data_type zsre \
-  --alg_name crispedit \
-  --cache_sample_num 10000 \
-  --energy_threshold 0.5 \
-  --batch_size 32 \
-  --plat_name none
+python scripts/hparam_search.py print --protocol
 ```
 
-模型会保存到 `HF_CACHE_DIR` 下，目录名由模型、算法、数据集和关键超参数自动生成。当前保存的是合并后的完整模型与 tokenizer，而不是只保存投影缓存或 LoRA adapter。
+查看某一轴：
 
-## 运行评测
+```bash
+python scripts/hparam_search.py print --axis lr --verbose
+```
 
-### 基础能力
+注意：该辅助器和两个 2026-08-26 调度脚本仍使用历史名称 `curpedit_adam`，并检查已经不存在的 `hparams/CurpEdit/llama3-8b.yaml`。它们不能直接用于当前 `run_rhoedit.py`；使用前需统一为 `rhoedit_adam` 和 `hparams/RhoEdit/llama3-8b.yaml`。
 
-直接调用 `run_base_benchmarks.py`。相对模型目录会与 `HF_CACHE_DIR` 拼接，绝对路径也可使用。
+## 评测
+
+### 原有能力
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python run_base_benchmarks.py \
-  --edited_model_dir <edited-model-directory> \
+  --edited_model_dir <run-id> \
   --model_name llama3-8b \
-  --alg_name CurpEdit \
-  --data_type wiki \
+  --alg_name RhoEdit \
+  --data_type counterfact \
   --tasks all \
   --eval_num 200 \
   --no_wandb
 ```
 
-`--tasks all` 包括 `ifeval`、`truthfulqa_mc2`、`mmlu`、`gsm8k_cot` 和 `arc_challenge`。当前 `--eval_num` 只限制 MMLU，其他任务仍会运行完整数据。结果写入：
+`--tasks all` 包括：
 
 ```text
-logs/<sanitized-model-directory>/capability.json
+ifeval, truthfulqa_mc2, mmlu, gsm8k_cot, arc_challenge
+```
+
+结果保存到：
+
+```text
+logs/<run-id>/capability.json
 ```
 
 ### 编辑质量
 
-直接调用 `run_edited_benchmarks.py`。该入口使用 vLLM，当前固定为 bfloat16、单卡和 90% GPU 显存利用率；`edited_model_dir` 应传入 `HF_CACHE_DIR` 下的相对目录名。
+Exact Match：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python run_edited_benchmarks.py \
-  --edited_model_dir <edited-model-directory> \
+  --edited_model_dir <run-id> \
   --model_name llama3-8b \
-  --alg_name CurpEdit \
-  --data_type wiki \
+  --alg_name RhoEdit \
+  --data_type counterfact \
   --context_type qa_inst \
   --evaluation_criteria exact_match \
   --eval_num 3000 \
   --no_wandb
 ```
 
-可选上下文为 `qa_inst`、`chat_temp`、`no_context`，判据为 `exact_match` 或 `llm_judge`。使用 LLM judge 时设置 `API_KEY`，并将判据替换为：
+LLM-as-a-Judge：
 
 ```bash
---evaluation_criteria llm_judge --judge_batch_size 16
+CUDA_VISIBLE_DEVICES=0 python run_edited_benchmarks.py \
+  --edited_model_dir <run-id> \
+  --model_name llama3-8b \
+  --alg_name RhoEdit \
+  --data_type counterfact \
+  --context_type no_context \
+  --evaluation_criteria llm_judge \
+  --judge_batch_size 16 \
+  --no_wandb
 ```
 
-SafeEdit 评测路径要求同时使用 `--context_type chat_temp` 和 `--evaluation_criteria llm_judge`。
-
-评测过程中持续写入 `results_pending_judge.json`，结束后生成 `results.json` 和 `mean_metrics.json`：
+编辑质量评测使用 vLLM，当前固定为单卡、`bfloat16` 和 `gpu_memory_utilization=0.9`。结果目录为：
 
 ```text
-logs/<edited-model-directory>_eval_<criterion>_<context>/
+logs/<run-id>_eval_<criterion>_<context>/
 ```
 
-### 汇总实验
+运行过程中写入 `results_pending_judge.json`，结束后生成 `results.json` 和 `mean_metrics.json`。
 
-结果收集器把一个基础能力目录与 `no_context`、`qa_inst` 两个 LLM-judge 目录视为同一实验：
+当前不建议使用 `run_benchmarks.py` 统一入口：它的 base 分支导入仓库中不存在的 `run_base_benchmarks_vllm.py`，edited 分支则要求 `run_edited_benchmarks.run()`，但当前脚本没有提供该函数。请直接调用上面的两个评测脚本。
+
+## 结果汇总
 
 ```bash
 python skills/analyze-results/collect_runs.py
 ```
 
-筛选运行：
+筛选实验：
 
 ```bash
-python skills/analyze-results/collect_runs.py --run <run-name>
-python skills/analyze-results/collect_runs.py --run-pattern '*curpedit*'
+python skills/analyze-results/collect_runs.py --run <run-id>
+python skills/analyze-results/collect_runs.py --run-pattern '*rhoedit*'
 ```
 
-默认报告写入 `docs/experiments/YYYYMMDD_HHMMSS_results_analysis.md`。收集器只把 `capability.json` 和 `mean_metrics.json` 视为权威汇总文件。
+收集器读取：
 
-## 辅助工具
+- `logs/<run-id>/capability.json`
+- `logs/<run-id>_eval_llm_judge_qa_inst/mean_metrics.json`
+- `logs/<run-id>_eval_llm_judge_no_context/mean_metrics.json`
 
-检查已有 K-FAC 因子的条件数：
+报告写入 `docs/experiments/<timestamp>_results_analysis.md`。缺失任一结果文件时，报告会将对应实验标记为不完整。
 
-```bash
-python check_kfac_condition.py \
-  --model_name Meta-Llama-3-8B-Instruct \
-  --base_ds wikipedia \
-  --base_sample_size 10000 \
-  --layers 19,20,21,22,23 \
-  --factor_damping 1e-5
+## 对比方法
+
+对比方法不是本仓库的主方法，主要用于 Table 1 和消融实验。
+
+| 方法 | 入口 | 配置目录 | 说明 |
+| --- | --- | --- | --- |
+| CrispEdit | `run_crispedit.py` | `hparams/CrispEdit/` | 单一能力子空间投影对比 |
+| FT | `run_crispedit.py --no_crisp` 或 `edit.py` | `hparams/FT/` | 无曲率约束微调 |
+| LoRA | `run_crispedit.py --no_crisp --perform_lora` 或 `edit.py` | `hparams/LoRA/` | LoRA/AdaLoRA 编辑 |
+| LocBF-FT | `locft-bf.py` | `hparams/FT/` | locality-aware baseline |
+| MEND | `edit.py --editing_method MEND` | `hparams/MEND/` | EasyEdit 基线 |
+| MEMIT | `edit.py --editing_method MEMIT` | `hparams/MEMIT/` | EasyEdit 基线 |
+| AlphaEdit | `edit.py --editing_method AlphaEdit` | `hparams/AlphaEdit/` | null-space 投影基线 |
+| AlphaEditFT | `alphaedit_ft.py` | `hparams/AlphaEditFT/` | AlphaEdit 风格 FT 实验入口 |
+| ROME | `edit.py --editing_method ROME` | `hparams/ROME/` | EasyEdit 基线 |
+| UltraEdit | `edit.py --editing_method UltraEdit` | `hparams/UltraEdit/` | EasyEdit 基线 |
+| WISE | `edit.py --editing_method WISE` | `hparams/WISE/` | EasyEdit 基线 |
+
+### Table 1 调度脚本
+
+| 脚本 | 模型与数据集 | 状态 |
+| --- | --- | --- |
+| `20260827_table1-easyeditor-baselines.sh` | Llama 3 8B / ZsRE | 单数据集基线训练 |
+| `20260827_table1-easyeditor-baselines-counterfact.sh` | Llama 3 8B / CounterFact | 单数据集基线训练 |
+| `20260827_table1-easyeditor-baselines-wiki.sh` | Llama 3 8B / WikiBigEdit | Wiki 脚本未包含 MEMIT 和 AlphaEdit |
+| `20260908_table1-easyeditor-baselines-qwen2.5-7b.sh` | Qwen2.5 7B / ZsRE、CounterFact、WikiBigEdit | 三阶段串行运行全部基线 |
+
+调度脚本依赖 Bash 4+、`nvidia-smi`、`bc`、`awk`、`sed` 等工具，并按空闲显存分配 GPU。`skip_or_train` 通过 `${HF_CACHE_DIR}<run-id>` 是否存在决定是否跳过训练。
+
+Qwen2.5 脚本按以下顺序执行：
+
+```text
+ZsRE -> CounterFact -> WikiBigEdit
 ```
 
-`toy_experiment/run_exp_sweep_recalculate.py` 在 LeNet 上比较 SGD、K-FAC、EKFAC、Hessian 和 Gauss-Newton 等投影；`toy_experiment/plot_roc.py` 读取其缓存并绘图。两者属于独立实验，不参与大模型主流程。其数据、缓存和图片路径都相对于当前工作目录，建议进入 `toy_experiment/` 后运行。当前 sweep 没有 CPU fallback，且保存文件的 `_special.pth` 后缀与绘图脚本默认读取名不一致，运行前需先统一路径。
-
-`scripts/run_0.sh` 是依赖 `nvidia-smi`、`bc`、awk/sed 的 Bash GPU 轮询队列。脚本中的任务名与部分旧参数已经过时，使用前应重新核对 `TASK_LIST`，不要直接批量提交。
+每个阶段会等待本阶段所有任务结束。如果阶段内任一任务失败，脚本立即退出，后续数据集不会启动。因此出现“只运行 ZsRE”时，应先查看 ZsRE 阶段中失败的方法，而不是检查 CounterFact/Wiki 任务列表。
 
 ## 当前限制
 
-以下问题已从当前代码确认，文档中的命令不会将其描述为已验证流程：
+以下限制来自当前代码实现，不代表方法设计本身：
 
-1. `hparams/CrispEdit/*.yaml` 使用 `alg_name: CrispEdit`，而加载器断言要求 `CRISPEDIT`；CurpEdit 的 Mistral 配置也有同类问题。
-2. `run_benchmarks.py` 的 base 分支导入未提供的 `run_base_benchmarks_vllm.py`，edited 分支要求 `run_edited_benchmarks.run()`，但该函数不存在。当前请直接调用两套评测脚本。
-3. `edit.py` 在导入阶段引用未定义的 `Scheme*` 名称，当前不能作为 EasyEdit 基线统一入口；库内算法实现和 YAML 仍可供修复与二次接线。
-4. CrispEdit 顺序编辑路径调用了未传入的 `tracker.log()`，当前 `--sequential_edit` 会失败；CurpEdit 则显式拒绝顺序编辑。
-5. `run_crispedit.py` 中 `--edit_sample_num`、`--newton_damping` 未写回超参数；CrispEdit 还忽略 CLI 的 `--lr`。需要修改对应 YAML 的值。
-6. `--target_modules` 使用 `type=list`，不适合从命令行传入逗号分隔列表；应保留默认值或从配置修正。
-7. `run_crispedit.py` 传给追踪器的 `mode` 与 `--no_wandb` 语义相反。无追踪运行建议使用 `--plat_name none`，不要依赖该开关。
-8. LLM judge 当前硬编码 DeepSeek endpoint 与 `deepseek-v4-flash`，`.env` 中的 `BASE_URL` 和 `MODEL` 不会改变实际调用。
-9. `calculate_AB_layer.py` 导入了不存在的 helper；AlphaEditFT、ROME、MEND、UltraEdit 的部分配置也依赖缺失文件或机器专用路径。
-10. SafeEdit 主编辑路径会重新映射安全数据字段，其训练目标语义尚未在本仓库中给出可靠说明，使用前需结合实验设计复核。
+1. `run_rhoedit.py` 的 CLI 列出了 `crispedit`，但 `get_hparams()` 只处理 `rhoedit_adam` 和 `rhoedit_sgd`。不要通过该入口选择 `crispedit`。
+2. 当前推荐路径是 `rhoedit_adam`。SGD 加载器仍断言 YAML 的 `alg_name` 为 `CURPEDIT`，而现有 RhoEdit YAML 使用 `RHOEDIT` 或 `CRISPEDIT`，因此 `rhoedit_sgd` 尚不能直接运行。
+3. `--sequential_edit` 当前不会进入 Adam 顺序编辑实现：主分发先匹配 `rhoedit_adam`，之后的顺序编辑分支不可达；顺序实现内部还直接调用 `wandb.log()`。
+4. `hparams/RhoEdit/qwen2.5-7b.yaml` 的 `alg_name` 仍是 `CRISPEDIT`，不能直接由 Adam RhoEdit 加载器读取。
+5. `--data_type` 不会自动同步 YAML 的 `task_mom2_dataset`。不同数据集实验必须手动核对任务曲率来源。
+6. `scripts/hparam_search.py` 和 2026-08-26 两个 RhoEdit 搜索脚本仍使用历史名称 `curpedit_adam` 与旧配置路径。
+7. `run_benchmarks.py` 当前不是可用的统一评测入口，请直接运行 `run_base_benchmarks.py` 和 `run_edited_benchmarks.py`。
+8. `run_rhoedit.py`、`utils.py` 和 `run_edited_benchmarks.py` 仍依赖 `HF_CACHE_DIR` 字符串拼接；路径结尾错误会导致模型查找或保存失败。
+9. 部分 Python 源码注释存在历史编码损坏，但不影响本 README 的 UTF-8 内容。
+10. 新增的 Llama 3.2 3B 配置是结构适配后的初始超参数，尚不能视为已经验证的最佳参数。
 
-## 开发与检查
+## 开发检查
 
-当前仓库的聚焦 CPU 测试是结果收集器：
-
-```bash
-python -m unittest skills/analyze-results/test_collect_runs.py -v
-```
-
-修改 Python 文件后至少执行：
+修改 Python 文件后至少运行：
 
 ```bash
 python -m py_compile path/to/changed_file.py
 ```
 
-若环境中已安装 Ruff，再运行 `ruff check path/to/changed_file.py`。
+结果收集器的 CPU 测试：
 
-完整实验应记录命令、模型、数据集、随机种子、设备、超参数和指标差异。不要把未运行的 GPU 基准写成已验证结果。
+```bash
+python -m unittest skills/analyze-results/test_collect_runs.py -v
+```
 
-## 代码来源说明
+如果环境安装了 Ruff：
 
-仓库基于 EasyEdit 风格的编辑器与算法实现继续开发，并内嵌了 PEFT、Knowledge Neurons、BLIP2 等上游/第三方代码子树。CrispEdit、CurpEdit 和 `easyeditor/mymodels/` 中的研究变体应与这些基础设施区分；使用或再分发时请同时检查各子目录中的原始许可证和版权声明。
+```bash
+ruff check <changed-files>
+```
+
+GPU 实验应记录模型、数据集、随机种子、设备、编辑层、统计样本数、`lr`、`newton_damping`、`soft_lambda` 和完整评测产物。不要把未实际运行的基准结果描述为已验证结果。
