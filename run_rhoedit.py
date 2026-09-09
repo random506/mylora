@@ -15,7 +15,8 @@ os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
 import argparse
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+#zwz
+from transformers import AutoConfig,AutoModelForCausalLM, AutoTokenizer
 
 from easyeditor.models.crispedit.utils import update_model_and_tokenizer_with_appropriate_padding_token
 from easyeditor.models.crispedit.CrispEdit_hparams import CrispEditHyperParams
@@ -201,9 +202,38 @@ if __name__ == "__main__":
     if os.path.exists(HF_CACHE_DIR+MODEL_NAME):
         MODEL_NAME=HF_CACHE_DIR+MODEL_NAME
     print(f" Load model path as:{MODEL_NAME}")
+    '''
+    #zwz需要保留的
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME,local_files_only=True)
     model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, device_map='auto',  
                                     local_files_only=True)
+    '''
+    tokenizer = AutoTokenizer.from_pretrained(
+        MODEL_NAME,
+        local_files_only=True,
+    )
+
+    config = AutoConfig.from_pretrained(
+        MODEL_NAME,
+        local_files_only=True,
+    )
+
+    device_map = {
+        "model.embed_tokens": 0,
+        "model.rotary_emb": 0,
+    }
+
+    for layer in range(config.num_hidden_layers):
+        device_map[f"model.layers.{layer}"] = 0 if  15 <= layer <= 19 else 1
+
+    device_map["model.norm"] = 1
+    device_map["lm_head"] = 1
+
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME,
+        device_map=device_map,
+        local_files_only=True,
+    )
     '''
 
     tokenizer = AutoTokenizer.from_pretrained(
